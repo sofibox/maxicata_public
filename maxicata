@@ -1,0 +1,2450 @@
+#!/bin/bash
+
+#"=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~="
+# Author: Arafat Ali | Email: webmaster@sofibox.com
+ADMIN_NAME="Arafat Ali"
+ADMIN_EMAIL="webmaster@sofibox.com"
+APP_SPECIFIC_NAME="Maxicata"
+APP_DESCRIPTION="${APP_SPECIFIC_NAME} This is a suricata script to monitor suspicious activity in a network with IPS capability. \
+If IP has bad score it will automatically block that IP"
+APP_STATUS="beta"
+APP_VERSION="1.0.0-${APP_STATUS}"
+#"=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~="
+
+# 
+# If it cannot be determined bad score (score=unknown), it will provide you some suggestion what to do with the IP in email
+# Current detection method is using suspicious log files, RBLScanner (by Intellex), aipdb score and Suricata detection engine
+# I wrote this script because there is none exist in the internet how to read suricata log file using bash. You also need a custom lua script for this.
+# Find that lua script at this repo code/etc/suricata/lua-output/maxicata.lua
+# Author: Arafat Ali | Email: arafat@sofibox.com
+# TODO use log file from domain specific for http: https://www.knownhost.com/wiki/control-panels/directadmin/directadmin-locations-of-logs#:~:text=Apache%20is%20the%20default%20webserver,log%20.
+# TODO make sure non-critical report has suspicious log information. Don't worry information on suspicious log count limited to ALERT_RATE
+# required components: ipcalc, bc, jq
+function usage() {
+  echo "${APP_SPECIFIC_NAME} Documentation"
+  echo
+  echo "Usage: "
+  echo "${SCRIPT_NAME} [options] [ip]..."
+  echo
+  echo "options:"
+  echo
+  echo "  -h, --help"
+  echo "      This help text."
+  echo
+  echo "  Help file will come later"
+}
+
+# cmd_args function is designed to be used by another script. maxicata -c <args> or maxicata --command <args>
+# Important note about AIPDB return data: If a record return from AIPDB is not available (or empty), AIPDB will return a null text value not a datatype of null
+function cmd_args() {
+  local cmd
+  # Clear the first argument $1 that is now '-c' or '--command'
+  shift
+  # Assign first argument $1 which is now empty to conditional command. eg: cmd="report-nc-ip"
+  cmd="$1"
+  # -----------------------------------------------------------------------------------------
+  # Documentation about this conditional aipdb-cache-ipinfo / aci:::::
+  # This conditional is used to pull AIPDB data information and save it in a database file called aipdb_ip.cache
+  # Usage 1: maxicata -c aipdb-cache-ipinfo <ip>
+  # Output (6): 1) "error, bad IP address format: <ip>" - If IP address given is not valid, then exit
+  # 2) "warning, AIPDB API check is down" - If AIPDB API check is down, then exit
+  # 3) "warning, found error returned from AIPDB: <.. error_details ..>" - If error occur when pulling data from AIPDB
+  # 4) "success, IP address ${ip_address} has been cached successfully with no error" - If IP address cached successfully with no error
+  # 5) "warning, found error when performing cache in file" - If problem when trying to cache the data in file (eg: IO error)
+  # 6) "notice, IP is already cached in AIPDB cache file" - If IP is already cached in AIPDB
+  if [[ "${cmd}" == "aipdb-cache-ipinfo" || "${cmd}" == "aci" ]]; then
+    local ip ret_val api res error_detail
+    local ip_address iswhitelisted abuse_confidence_score isp usage_type domain country_name country_code total_report num_distinct_user last_reported_at
+    shift
+    ip="$1"
+
+    if [ "$(
+      ipcalc -c -s "${ip}"
+      echo $?
+    )" = 1 ]; then #
+      echo "error, bad IP address format: ${ip}"
+      exit 1
+    fi
+
+    grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${AIPDB_IP_CACHED}"
+    ret_val=$?
+    if [ "${ret_val}" = 1 ]; then
+      # echo "false"
+      # If IP is not cache, then we cache it
+      #aipdb_api_status_desc="N/A"
+
+      if [ "$(curl -LI "${AIPDB_CHECK_URL}" -o /dev/null -w '%{http_code}\n' -s)" != "200" ]; then
+        #api_server_down="true"
+        #echo "warning, AIPDB API check is down"
+
+        # Need to assign this value if API down to prevent script error (temporary using this solution)
+        ip_address="api-down"
+        iswhitelisted="api-down"
+        abuse_confidence_score="0"
+        isp="api-down"
+        usage_type="api-down"
+        domain="api-down"
+        country_name="api-down"
+        country_code="api-down"
+        total_report="0"
+        num_distinct_user="0"
+        last_reported_at="api-down"
+        echo "api-check-is-down"
+        exit 1
+      else
+        # If AIPDB API check is not down
+        #api_server_down="false"
+        api=$(curl -G "${AIPDB_CHECK_URL}" --data-urlencode "ipAddress=${ip}" -d maxAgeInDays=90 -d verbose -H "Key: ${AIPDB_API_KEY}" -H "Accept: application/json" | jq -r '.')
+        res=$(echo "${api}" | jq .)
+
+        # Filter the data and store in variable
+        # This will return value only if there is an errors element appear in json because of the symbol '?' Also, we only return the first error element.
+        error_detail=$(echo "${res}" | jq -r 'first(.errors[]? | .detail)')
+        ip_address=$(echo "${res}" | jq -r '.data.ipAddress')
+        iswhitelisted=$(echo "${res}" | jq -r '.data.isWhitelisted')
+        abuse_confidence_score=$(echo "${res}" | jq -r '.data.abuseConfidenceScore')
+        isp=$(echo "${res}" | jq -r '.data.isp')
+        usage_type=$(echo "${res}" | jq -r '.data.usageType')
+        domain=$(echo "${res}" | jq -r '.data.domain')
+        country_name=$(echo "${res}" | jq -r '.data.countryName')
+        country_code=$(echo "${res}" | jq -r '.data.countryCode')
+        total_report=$(echo "${res}" | jq -r '.data.totalReports')
+        num_distinct_user=$(echo "${res}" | jq -r '.data.numDistinctUsers')
+        last_reported_at=$(echo "${res}" | jq -r '.data.lastReportedAt')
+
+        # Check if the string returned from the API is null if yes set default value for it
+
+        if [[ -z "${ip_address}" || "${ip_address}" == "" || "${ip_address}" == "null" ]]; then
+          ip_address="${ip}"
+        fi
+
+        if [[ -z "${iswhitelisted}" || "${iswhitelisted}" == "" || "${iswhitelisted}" == "null" ]]; then
+          iswhitelisted="unknown"
+        fi
+
+        if [[ -z "${abuse_confidence_score}" || "${abuse_confidence_score}" == "" || "${abuse_confidence_score}" == "null" ]]; then
+          abuse_confidence_score="0"
+        fi
+        if [[ -z "${isp}" || "${isp}" == "" || "${isp}" == "null" ]]; then
+          isp="unknown"
+        fi
+
+        if [[ -z "${usage_type}" || "${usage_type}" == "" || "${usage_type}" == "null" ]]; then
+          usage_type="unknown"
+        fi
+
+        if [[ -z "${domain}" || "${domain}" == "" || "${domain}" == "null" ]]; then
+          domain="unknown"
+        fi
+
+        if [[ -z "${country_name}" || "${country_name}" == "" || "${country_name}" == "null" ]]; then
+          country_name="unknown"
+        fi
+
+        if [[ -z "${country_code}" || "${country_code}" == "" || "${country_code}" == "null" ]]; then
+          country_code="unknown"
+        fi
+
+        if [[ -z "${total_report}" || "${total_report}" == "" || "${total_report}" == "null" ]]; then
+          total_report="0"
+        fi
+
+        if [[ -z "${num_distinct_user}" || "${num_distinct_user}" == "" || "${num_distinct_user}" == "null" ]]; then
+          num_distinct_user="0"
+        fi
+
+        if [[ -z "${last_reported_at}" || "${last_reported_at}" == "" || "${last_reported_at}" == "null" ]]; then
+          last_reported_at="unknown"
+        fi
+
+        if [ -n "$error_detail" ]; then # This wil printout the error
+          echo "warning, found error returned from AIPDB: ${error_detail}"
+        else
+          # Store in cache because no error found
+          echo "|ip: ${ip_address} |time: $(date +%s) |iswhitelisted: ${iswhitelisted} |abuse_score: ${abuse_confidence_score} |isp: ${isp} |usage_type: ${usage_type} |domain: ${domain} |country_name: ${country_name} |country_code: ${country_code} |total_report: ${total_report} |distinct_report: ${num_distinct_user} |last_report: ${last_reported_at}" >>"${AIPDB_IP_CACHED}"
+          ret_val=$?
+          if [ ${ret_val} = 0 ]; then
+            echo "success, IP address ${ip_address} has been cached successfully in $(basename "${AIPDB_IP_CACHED}")"
+          else
+            echo "warning, found error when performing cache in file"
+          fi
+        fi
+      fi
+    else
+      echo "notice, IP is already cached in AIPDB cache file"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c is-aipdb-ip-cached <ip>
+  # Output (2): 1) "true" - IP is in AIPDB cache file | 2) "false" - IP is not in AIPDB cache file
+  if [[ "${cmd}" == "is-aipdb-ip-cached" || "${cmd}" == "iaic" ]]; then
+    local ip ret
+    # remove cmd argument
+    shift
+    ip="$1"
+    # grep -q -w '[^.0-9a-fA-F]'"${ip}"'[^.0-9a-fA^C]' "${AIPDB_IP_CACHED}" -- OLD
+    # New method:
+    grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${AIPDB_IP_CACHED}"
+    ret=$?
+    if [ "${ret}" = 0 ]; then
+      # Cached in AIPDB file
+      echo "true"
+    else
+      # Not cached in AIPDB file
+      echo "false"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c aipdb-get-cached-var <ip> <var_field_name>
+  # eg: maxicata -c aipdb-get-cached-var 1.2.3.4 domain
+  # output (2): 1) "<.. var-field-value ..>" - If found variable for given IP it will display it
+  # 2) "empty-var" - If the given IP and variable field name don't match in the AIPDB_IP_CACHED cache file
+  if [[ "${cmd}" == "aipdb-get-cached-var" || "${cmd}" == "agvc" ]]; then
+    local ip field out
+    # remove cmd argument
+    shift
+    ip="$1"
+    field="$2"
+    out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${AIPDB_IP_CACHED}" | awk -v fld="${field}" -f "${AWK_SEARCH_P}")
+    if [ -n "${out}" ]; then
+      # Found variable of $field for this specific IP
+      echo "${out}"
+    else
+      # No variable of $field for this specific IP
+      echo "empty-var"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c get-whitelisted-ip-var <ip_address> <field_name>
+  # eg: maxicata -c get-whitelisted-ip-var 1.1.1.1 'ip'
+  # output (2): 1) "<.. var-field-value ..>" - If found variable for given IP it will display it
+  # 2) "empty-var" - If the given IP and variable field name don't match in the WHITELISTED_IP cache file
+  if [[ "${cmd}" == "get-whitelisted-ip-var" || "${cmd}" == "gwiv" ]]; then
+    local ip field out
+    # remove cmd argument
+    shift
+    ip="$1"
+    field="$2"
+    out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${WHITELISTED_IP}" | awk -v fld="${field}" -f "${AWK_SEARCH_P}")
+    if [ -n "${out}" ]; then
+      # Found variable of $field for this specific IP
+      echo "${out}"
+    else
+      # No variable of $field for this specific IP
+      echo "empty-var"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c get-ignored-ip-var <ip_address> <field_name>
+  # eg: maxicata -c get-ignored-ip-var 1.1.1.1 'ip'
+  # output (2): 1) "<.. var-field-value ..>" - If found variable for given IP it will display it
+  # 2) "empty-var" - If the given IP and variable field name don't match in the IGNORED_IP cache file
+  if [[ "${cmd}" == "get-ignored-ip-var" || "${cmd}" == "giiv" ]]; then
+    local ip field out
+    # remove cmd argument
+    shift
+    ip="$1"
+    field="$2"
+    out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${IGNORED_IP}" | awk -v fld="${field}" -f "${AWK_SEARCH_P}")
+    if [ -n "${out}" ]; then
+      # Found variable of $field for this specific IP
+      echo "${out}"
+    else
+      # No variable of $field for this specific IP
+      echo "empty-var"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c get-suppressed-ip-var <ip_address> <field_name>
+  # eg: maxicata -c get-suppressed-ip-var 1.1.1.1 'ip'
+  # output (2): 1) "<.. var-field-value ..>" - If found variable for given IP it will display it
+  # 2) "empty-var" - If the given IP and variable field name don't match in the SUPPRESSED_IP cache file
+  if [[ "${cmd}" == "get-suppressed-ip-var" || "${cmd}" == "gsiv" ]]; then
+    local ip field out
+    # remove cmd argument
+    shift
+    ip="$1"
+    field="$2"
+    out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${SUPPRESSED_IP}" | awk -v fld="${field}" -f "${AWK_SEARCH_P}")
+    if [ -n "${out}" ]; then
+      # Found variable of $field for this specific IP
+      echo "${out}"
+    else
+      # No variable of $field for this specific IP
+      echo "empty-var"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c get-suppressed-msg-var <msg_rule> <field_name>
+  # eg: maxicata -c get-suppressed-msg-var 'Suricata invalid checksum' 'msg'
+  # output (2): 1) "<.. var-field-value ..>" - If found variable for given message rule it will display it
+  # 2) "empty-var" - If the given message rule and variable field name don't match in the SUPPRESSED_MSG cache file
+  if [[ "${cmd}" == "get-suppressed-msg-var" || "${cmd}" == "gsmv" ]]; then
+    local msg_rule field out
+    # remove cmd argument
+    shift
+    msg_rule="$1"
+    field="$2"
+    out=$(grep -w "|msg: ${msg_rule}" "${SUPPRESSED_MSG}" | awk -v fld="${field}" -f "${AWK_SEARCH_P}")
+    if [ -n "${out}" ]; then
+      # Found variable of $field for this specific message
+      echo "${out}"
+    else
+      # No variable of $field for this specific message
+      echo "empty-var"
+    fi
+  fi
+
+  # -----------------------------------END---------------------------------------------------
+  # -----------------------------------------------------------------------------------------
+  # Usage 1: maxicata -c get-blacklisted-cache-var <ip> <field_name>
+  # eg: maxicata -c get-blacklisted-cache-var '1.1.1.1' 'ip'
+  # output (2): 1) "<.. var-field-value ..>" - If found variable for given IP it will display it
+  # 2) "empty-var" - If the given IP and variable field name don't match in the RBL_BLACKLISTED_IP_CACHED cache file
+  if [[ "${cmd}" == "get-blacklisted-cache-var" || "${cmd}" == "gbcv" ]]; then
+    local ip field out
+    # remove cmd argument
+    shift
+    ip="$1"
+    field="$2"
+
+    out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${RBL_BLACKLISTED_IP_CACHED}" | awk -v fld="${field}" -f "${AWK_SEARCH_P}")
+
+    if [ -n "${out}" ]; then
+      # Found variable of $field for this specific IP
+      # echo "${out}"
+      # Add space between domain
+      echo "${out}" | awk -v OFS=", " '$1=$1'
+    else
+      # No variable of $field for this specific IP
+      echo "empty-var"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  if [[ "${cmd}" == "suppress-ip" || "${cmd}" == "sip" ]]; then
+    # This one should be used for putting IP as non-critical -TODO
+    # TODO function suppress (function use to put ip as non-critical) that is the meaning of suppress it will use ${SUPPRESSED_IP}
+    # also look for TODO 10 in maxicata.lua for more condition
+    local ip check_sip
+    shift
+    ip="$1"
+    sid="$2"
+    msg_comment="${*:3}"
+    if [ -z "${sid}" ]; then
+      # echo "[${SCRIPT_NAME}]: Error, missing signature ID. e.g: ${SCRIPT_NAME} ${opt} <ip> 12344 <comment string>"
+      echo "false"
+      exit 1
+    fi
+    check_sip=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${SUPPRESSED_IP}")
+    # If IP is in the cached file, then just display error
+    if [ -n "${check_sip}" ]; then
+      echo "false"
+      exit 1
+    else
+      echo "|ip_address: ${ip} |sid: ${sid} |time: $(date +%s) |comment: ${msg_comment}" >>"${SUPPRESSED_IP}"
+      #echo "[${SCRIPT_NAME}]: Success, IP [${ip_add}] is now in suppressed list and will be put in non-critical alert report"
+      echo "true"
+      exit 0
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+  # -----------------------------------------------------------------------------------------
+
+  if [[ "${cmd}" == "ignore-ip" || "${cmd}" == "iip" ]]; then
+
+    local ip sid check_iip msg_comment
+    shift
+    ip="$1"
+    sid="$2"
+    msg_comment="${*:3}"
+    if [ -z "${sid}" ]; then
+      # echo "[${SCRIPT_NAME}]: Error, missing signature ID. e.g: ${SCRIPT_NAME} ${opt} <ip> 12344 <comment string>"
+      echo "false"
+      exit 1
+    fi
+    check_iip=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${IGNORED_IP}")
+    # If IP is in the cached file, then just display error
+    if [ -n "${check_iip}" ]; then
+      echo "false"
+      exit 1
+    else
+      echo "|ip_address: ${ip} |sid: ${sid} |time: $(date +%s) |comment: ${msg_comment}" >>"${IGNORED_IP}"
+      #echo "[${SCRIPT_NAME}]: Success, IP [${ip_add}] is now in ignored list and will not be reported in suricata"
+      echo "true"
+      exit 0
+    fi
+  fi
+
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # Usage 1: maxicata -c deny <ip>
+  # Output (4) 1) "error, missing IP address argument" - If IP address is not supplied then exit
+  # 2) "error, bad ip address format: <ip> - If IP address given is not valid then exit
+  # 3) "true" - If IP is in permanent block list | "Adding <.. success message ..>" - If IP is successfully added in blocked list
+  # 4) "< .. some error .. >" - If IP has problem when blocking
+  if [[ "${cmd}" == "deny" || "${cmd}" == "d" ]]; then
+    local ip msg_comment block_status success_block ret_val check_csf_deny
+    shift
+    ip="$1"
+    msg_comment="${SCRIPT_NAME}: ${*:2}"
+    if [ -z "${ip}" ]; then
+      # echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} -c deny 1.2.3.4" -- This one for maxicata -d
+      echo "error, missing IP address argument"
+      exit 1
+    fi
+
+    if [ "$(
+      ipcalc -c -s "${ip}"
+      echo $?
+    )" = 1 ]; then
+      echo "error, bad IP address format: ${ip}"
+      exit 1
+    else
+      #New method will also detect CIDR format
+      check_csf_deny=$(csf -g "${ip}" | grep -E 'IPSET: Set:chain_DENY Match:')
+      if [ -n "$check_csf_deny" ]; then
+        # is blocked in permanent list
+        # echo "CSF has already blocked this IP"
+        echo "true" # Use this string instead
+      else
+        # echo "false"
+        # is not block in permanent list
+        block_status=$(csf -d "${ip}" "${msg_comment}")
+        success_block=$(echo "${block_status}" | grep 'Adding')
+        ret_val=$?
+        if [ "${ret_val}" = 1 ]; then
+          # Show error message from block_status
+          echo "${block_status}"
+        else
+          #Restarting CSF ..."
+          csf -ra >/dev/null
+          # Show success block
+          echo "${success_block}"
+        fi
+      fi
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+  # -----------------------------------------------------------------------------------------
+  # maxicata -c ip2cidr <ip> <mask_bit>
+  if [[ "${cmd}" == "ip2cidr" || "${cmd}" == "i2c" ]]; then
+    opt="$1"
+    ip_add="$2"
+    mask_bit="$3"
+    if [ -z "${ip_add}" ]; then
+      #echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4 24"
+      exit 1
+    fi
+    if [ -z "${mask_bit}" ]; then
+      #echo "[${SCRIPT_NAME}]: Error, missing mask bit argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4 24"
+      exit 1
+    fi
+    if [ "${mask_bit}" == "24" ]; then
+      oc1=$(echo "${ip_add}" | cut -d '.' -f 1)
+      oc2=$(echo "${ip_add}" | cut -d '.' -f 2)
+      oc3=$(echo "${ip_add}" | cut -d '.' -f 3)
+      ip="${oc1}.${oc2}.${oc3}.0/24"
+
+      echo "${ip}"
+      exit 0
+    else
+      exit 1
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c is-csf-ip-perm-blocked <ip>
+  # output (3):
+  # 1) "true" - IP is blocked in permanent list | 2) "false" - IP is not blocked in permanent list
+  # 3) "error, bad IP format: <ip>" - IP given is not valid, then script will exit
+  if [[ "${cmd}" == "is-csf-ip-perm-blocked" || "${cmd}" == "icipb" ]]; then
+    local ip check_csf_deny
+    # remove cmd argument to reuse $1
+    shift
+    ip="$1"
+
+    if [ "$(
+      ipcalc -c -s "${ip}"
+      echo $?
+    )" = 1 ]; then
+      # If IP is not in good format, we display error and exit checking
+      echo "error, bad IP format: ${ip}"
+      exit 1
+    else
+      # TODO success (Need testing this)
+      # New method of checking. This will also detect CIDR format!
+      # For example: 1.2.3.0/24 is in the /etc/csf/csf.deny and provided IP is 1.2.3.1 it can detect as well.
+      check_csf_deny=$(csf -g "${ip}" | grep -E 'IPSET: Set:chain_DENY Match:')
+      if [ -n "$check_csf_deny" ]; then
+        # is blocked in permanent list
+        echo "true" #Have
+      else
+        # is not blocked in permanent list
+        echo "false"
+      fi
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage: maxicata -c get-ip-blacklisted-cache-count <ip>
+  # eg: maxicata -c 'get-ip-blacklisted-cache-count' '1.2.3.4'
+  # output (2): 1) "<.. total_IP_blacklisted_count ..>" - If IP is in blacklisted cache file, printout the total blacklist
+  # 2) "not-found" - If IP is not cache in RBL_BLACKLISTED_IP_CACHED file
+  if [[ "${cmd}" == "get-ip-blacklisted-cache-count" || "${cmd}" == "gibcc" ]]; then
+    local ip out
+    shift # remove cmd argument
+    ip="$1"
+
+    out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${RBL_BLACKLISTED_IP_CACHED}" | awk '{ print $6 }')
+    if [ -n "${out}" ]; then
+      # Directly printout the blacklisted count not "yes"
+      echo "${out}"
+    else
+      echo "not-found"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage: maxicata -c sleep <sleep_duration>
+  # output: none
+  if [[ "${cmd}" == "sleep" ]]; then
+    local duration
+    # remove cmd argument
+    shift
+    duration="$1"
+    sleep "${duration}"
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage: maxicata -c rblscan <ip>
+  # output (1) 1) "< .. blacklist count .. >" - It will only output number of blacklist count after scan
+  if [[ "${cmd}" == "rblscan" || "${cmd}" == "rbls" ]]; then
+    local ip out
+    shift # remove cmd argument
+    ip="$1"
+    # Since the command is running in background then, we need mark is as scanning
+    # So we create empty file with the name of the ip that is currently scanning
+    touch "${IP_SCAN_PDIR}/${ip}"
+    # We can then remove that file later in after finished scanning.
+    # This will only output blacklist count if we use $?
+    out=$(
+      maxirbl -q "${ip}"
+      echo $?
+    )
+    echo "${out}"
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c is-rbl-scan-ip <ip>
+  # output (2): 1) "true" - If rblscan is checking for this IP, 2) "false" - If rblscan is not checking for this IP
+  if [ "${cmd}" == "is-rbl-scan-ip" ]; then
+    local ip PID_IP_SCAN
+    # remove cmd argument
+    shift
+    ip="$1"
+    PID_IP_SCAN="${IP_SCAN_PDIR}/${ip}"
+    if [ -f "${PID_IP_SCAN}" ]; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+  # -----------------------------------------------------------------------------------------
+  # usage 1: maxicata -c ipv4-escape <ip>
+  # output (2): 1) "error, bad IP format: <ip>" - If IP is not valid
+  # 2) "< .. escaped_ipv4_IP ..>" - Output IPv4 in escaped format
+  if [ "${cmd}" == "ipv4-escape" ]; then
+    local ip
+    # remove cmd argument
+    shift
+    ip="$1"
+    if [ "$(
+      ipcalc -c -s "${ip}"
+      echo $?
+    )" = 1 ]; then
+      # If IP is not in good format, we display error and exit checking
+      echo "error, bad IP format: ${ip}"
+      exit 1
+    else
+
+      #Escape the ipv4 to be used in regex correctly
+      echo "${ip//./\\.}"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # Usage 1: maxicata -c report-to-aipdb <ip> <attack_category> <comment>
+  # eg: maxicata -c 'report-to-aipdb' '1.1.1.1' '15,21' 'This IP is suspicious and is attacking me'
+  # output (4): 1) "warning, AIPDB API report is down" - If API report is down, this will be displayed
+  # 2) "warning, found error: <error_details>" - This will display if error found when submit report
+  # 3) "ok, <ip> has been reported successfully with no error" - If IP has reported with success
+  # 4) echo "notice, <ip> has been reported into AIPDB before" - If IP has already been reported before based on cache file
+  if [ "${cmd}" == "report-to-aipdb" ]; then
+    local ip sur_category sur_comment exe error_status out
+    shift # remove cmd argument (start fresh)
+    ip="$1"
+    sur_category="$2"
+    sur_comment="${*:3}"
+    if [ "$(curl -LI "${AIPDB_REPORT_URL}" -o /dev/null -w '%{http_code}\n' -s)" != "200" ]; then
+      echo "Warning, AIPDB API report is down"
+      exit 1
+    else
+      # API report is not down
+      out=$(grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${AIPDB_IP_REPORTED_CACHED}")
+      if [ -z "${out}" ]; then
+        # Meaning has not reported then we call report
+        exe=$(
+          timeout 30 curl "${AIPDB_REPORT_URL}" \
+            --data-urlencode "ip=${ip}" \
+            -d categories="${sur_category}" \
+            --data-urlencode "comment=${sur_comment}" \
+            -H "Key: ${AIPDB_API_KEY}" \
+            -H "Accept: application/json"
+        )
+        # error_status=$(echo "${exe}" | jq -r '.errors[] | .status')
+        # Only return the first collection of an error, don't care about others | one error is one step of a mandkind - MaXi32, 2001
+        error_status=$(echo "${exe}" | jq -r 'first(.errors[]? | .detail)')
+
+        if [ -n "${error_status}" ]; then
+          echo "Warning, found error: ${error_status}"
+          exit 1
+        else
+          echo "|ip: ${ip} |time: $(date +%s)" >>"${AIPDB_IP_REPORTED_CACHED}"
+          echo "Ok, ${ip} has been reported successfully into AIPDB web."
+          exit 0
+        fi
+      else
+        echo "Warning, ${ip} has been reported into AIPDB before. Please wait within 15 minutes to report the same IP"
+        exit 1
+      fi
+    fi
+    # echo "${error_detail}" # Just return error_detail
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # Documentation about this conditional report-non-critical-ip / rncip:::::
+  # This function calculates non-critical log file (called maxicata-n-limit.log), collect them after it has reached $alert_rate value
+  # Normally IP with suppressed list or suppressed message, will be stored here. The reason is to reduce noise report
+  # It also creates statistic about each IP details from AIPDB.
+  # usage 1: maxicata -c report-non-critical-ip <input_file> <src_ip_field> <dst_ip_field> <last_record_sid>
+  # eg: You can redirect to generate output like: maxicata -c report-non-critical-ip input.txt 21 26 34 > output.txt
+
+  # TODO - This part is important for non-critical report. Need to design this perfectly
+  if [[ "${cmd}" == "report-non-critical-ip" || "${cmd}" == "rncip" ]]; then
+    local file_input src_ip_fld dst_ip_fld last_record_sid last_record
+    local ip_count record_count loop_count ip_total error_status aipdb_score_max rc_text is_aipdb_ip_cached aipdb_cached_label aipdb_score_desc #aipdb_ip_cache_status
+    local ip_address iswhitelisted abuse_confidence_score isp usage_type domain country_name country_code total_report num_distinct_user last_reported_at report_time
+
+    # Clear the first argument $1 that is now 'report-non-critical-ip' or 'rncip'
+    shift
+    # Assign first argument $1 as file_input
+    file_input="$1"
+    # Assign second, third argument and fourth for source, destination and last SID respectively
+    src_ip_fld="$2"
+    dst_ip_fld="$3"
+    last_record_sid="$4"
+    # Check if src_ip_fld or dst_ip_fld or last_record_sid exist, if one of them is not supplied we cannot proceed
+    if [[ -z "${src_ip_fld}" || -z "${dst_ip_fld}" || -z "${last_record_sid}" ]]; then
+      echo "warning, missing some arguments. eg: [maxicata 'report-non-critical-ip' 'input.txt' '2' '3' '24'] where 2 is src_ip_fl, and 3 is dst_ip_fld and 24 is the last_record_sid"
+      exit 1
+    fi
+    # Check if file input exist, we cannot proceed if it doesn't exist, because we depend on input file
+    if [ ! -e "${file_input}" ]; then
+      echo "warning, file input does not exist"
+      exit 1
+    fi
+    ip_count=$({
+      # For awk statement, we also obtain column position for inbound and outbound IP.
+      # So, the report can be called with different column position when report column has changed and we don't have to edit this code
+      # Current src_ip_fld position is 21, current dst_ip_fld position is 26
+      awk -v src_ip_fld="$2" '{ print $src_ip_fld }' "${file_input}"
+      awk -v dst_ip_fld="$3" '{ print $dst_ip_fld }' "${file_input}"
+      # The maxicata-n-limit.log has space between record, so we need to ignore that space too
+    } | grep -v -e '^[[:space:]]*$' | grep -v 'LOCAL_IP' | sort | uniq -c | sed 's/^ *//')
+    # This will be the unique main IP address that we are going to use after combination of ip_count
+    ip=$(echo "$ip_count" | awk '{ print $2 }')
+    # This is the record count for each IP
+    record_count=$(echo "$ip_count" | awk '{ print $1 }')
+    # This is the total of all unique IP in the record
+    ip_total=$(echo "${ip}" | wc -l)
+    # For looping record
+    loop_count=0
+    # For keeping error status
+    error_status=0
+    # Store the maximum aipdb score
+    aipdb_score_max=0
+    # rc_text is for grammar purpose
+    rc_text="record"
+    #aipdb_api_status_desc="Unknown"
+    aipdb_score_desc="Unknown"
+    while read -r record_count ip; do
+      ((loop_count++))
+      last_record=$(grep -w "[^.0-9a-fA-F]${ip}[^.0-9a-fA-F]" "${file_input}" | tail -1)
+      # current last_record_sid position is 34
+      last_record_sid=$(echo "${last_record}" | awk -v last_record_sid="$4" '{ print $last_record_sid }')
+
+      # For grammar purpose
+      if [ "${record_count}" -gt 1 ]; then
+        rc_text="records"
+      else
+        rc_text="record"
+      fi
+
+      # Must use cache to prevent limit usage overhead
+      # This will check if IP is cache or not, if it's not cache we call it
+      is_aipdb_ip_cached=$(${SCRIPT_NAME} -c is-aipdb-ip-cached "${ip}")
+      if [ "${is_aipdb_ip_cached}" = "false" ]; then # Meaning IP is not cache
+        #aipdb_ip_cache_status=$(maxicata -c aipdb-cache-ipinfo "${ip}")
+        ${SCRIPT_NAME} -c aipdb-cache-ipinfo "${ip}"
+        aipdb_cached_label="new"
+      else
+        #aipdb_ip_cache_status="AIPDB API was not called. Using cached IP info"
+        aipdb_cached_label="cached"
+      fi
+
+      # So we know that we will have that cache IP, now it's time to assign each of them in each a proper variable
+      ip_address=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'ip')
+      iswhitelisted=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'iswhitelisted')
+      abuse_confidence_score=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'abuse_score')
+      isp=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'isp')
+      usage_type=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'usage_type')
+      domain=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'domain')
+      country_name=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'country_name')
+      country_code=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'country_code')
+      total_report=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'total_report')
+      num_distinct_user=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'distinct_report')
+      last_reported_at=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'last_report')
+      report_time=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip}" 'time')
+
+      # Get the highest confidence score and store as maximum value
+      if [ "${abuse_confidence_score}" -gt ${aipdb_score_max} ]; then
+        aipdb_score_max=${abuse_confidence_score}
+      fi
+      # Found abuse score (greater than 0% and less than 80)
+      if [[ "${aipdb_score_max}" -gt 0 && "${aipdb_score_max}" -lt 80 ]]; then
+        aipdb_score_desc="notice, found the maximum of abuse confidence score of ${aipdb_score_max}% from ${ip_total} IP(s)"
+      elif [ "${aipdb_score_max}" -ge 80 ]; then # Found abuse score (greater than 0%)
+        aipdb_score_desc="warning, found the maximum of abuse confidence score of ${aipdb_score_max}% from ${ip_total} IP(s)"
+      else # Not found abuse score (0%)
+        aipdb_score_desc="ok, maximum abuse confidence score is ${aipdb_score_max}% from ${ip_total} IP(s)"
+      fi
+      echo ""
+      echo "${loop_count}) ${ip} (${record_count} ${rc_text}) - ${abuse_confidence_score}% [${aipdb_cached_label} IP info since: $(date -d @"${report_time}")]:"
+      echo "-----------------------------"
+      echo "Domain Name/Country Name-Country Code/ISP/Usage Type: ${domain}/${country_name}-${country_code}/${isp}/${usage_type}"
+      echo "IP Whitelisted?: ${iswhitelisted}"
+      echo "*---*"
+      echo "This IP address has been reported a total of ${total_report} time(s) from ${num_distinct_user} distinct sources. ${ip} most recent report was at [${last_reported_at}]"
+      echo "More info at: https://www.abuseipdb.com/check/${ip} or use maxicata -i <ip>"
+      # echo "${aipdb_ip_cache_status}"
+      echo "*---*"
+      echo ""
+      echo "Last activity recorded:"
+      echo "-------"
+      echo "${last_record}"
+      echo ""
+      # Try to reduce information on this report and we can use maxicata -i for more details for this IP
+      echo "---------------------"
+      echo "Your Action on this IP:"
+      echo "---------------------"
+      echo "1) Check more information about this IP:"
+      echo "${SCRIPT_NAME} -i ${ip}"
+      echo ""
+      echo "2) Block this IP using CSF:"
+      echo "${SCRIPT_NAME} -dip ${ip} Suricata_Manual_Block_N_Report '|GeoIP: ${isp}/${usage_type}/${domain}/${country_name}/${country_code} | Abuse_Percentage: ${abuse_confidence_score}% | Total_Report: ${total_report} | Num_Distinct_Report: ${num_distinct_user} # do not delete'" # TODO make this shorter
+      echo ""
+      echo "3) Whitelist this IP from reporting in Suricata (For good IP):"
+      echo "${SCRIPT_NAME} -wip ${ip} ${last_record_sid} '|GeoIP: ${isp}/${usage_type}/${domain}/${country_name}/${country_code} | Abuse_Percentage: ${abuse_confidence_score}%'"
+      echo ""
+      echo "4) Ignore this IP from reporting in Suricata (For bad IP):"
+      echo "${SCRIPT_NAME} -iip ${ip} ${last_record_sid} '|GeoIP: ${isp}/${usage_type}/${domain}/${country_name}/${country_code} | Abuse_Percentage: ${abuse_confidence_score}%'"
+      echo "-----------------------------"
+      echo ""
+    done <<<"${ip_count}"
+    echo ""
+    echo "Non-critical IP Report Summary:"
+    echo "------"
+    echo "Total non-critical IP recorded: ${ip_total}"
+    echo "AIPDB Score Info: ${aipdb_score_desc}"
+    echo "------"
+    echo ""
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # TODO improve this
+  # maxicata -c get-attack-category <ip> or maxicata -c rsl <ip>
+  # It will write log and return the number of suspicious log | 0 1 2
+  #21 categorize as web attack #18 = categorize as bruteforce attack, #11 = categorize as email spam 0# means nothing
+  if [[ "${cmd}" == "get-attack-category" || "${cmd}" == "gac" ]]; then
+    local ip path_count susp_log_count attack_status ret_val output mod_sec
+    shift # remove cmd argument (start fresh)
+    ip="$1"
+    cat /dev/null >"${SUSP_LOG_RPT}"
+    path_count=0
+    susp_log_count=0
+    attack_status="0"
+    mod_sec="no (might disabled for certain webs)"
+    while read -r ALERT_LOCS ALERT_INFO; do
+      # grep -F "${ip}" "${ALERT_LOCS}" >"${TEMP_GREP}"
+      # This regex working perfectly with ipv4, for ipv6 it also work but I need ipcalc to verify if ip is valid or not before calling this
+      if [ "$(
+        ipcalc -c -s "${ip}"
+        echo $?
+      )" = 1 ]; then #
+        echo "Warning, bad IP format: $chk_ip"
+        exit 1
+      else
+        grep -E "(^|[^.0-9a-fA-F])${ip//./\\.}([^.0-9a-fA^C]|$)" "${ALERT_LOCS}" >"${TEMP_GREP}"
+        ret_val=$?
+        if [ ${ret_val} = 0 ]; then
+
+          ((path_count++))
+          if [[ "${ALERT_LOCS}" == "/var/log/exim/mainlog" || "${ALERT_LOCS}" == "/var/log/suricata/fast.log" ]]; then
+            :
+          else
+            ((susp_log_count++))
+          fi
+          # Bruteforce attack condition from log file
+          if [[ "${ALERT_LOCS}" == "/var/log/messages" || "${ALERT_LOCS}" == "/var/log/secure" || "${ALERT_LOCS}" == "/var/log/maillog" || "${ALERT_LOCS}" == "/var/www/html/roundcube/logs/errors.log" || "${ALERT_LOCS}" == "/var/www/html/phpMyAdmin/log/auth.log" || "${ALERT_LOCS}" == "/var/log/exim/mainlog" || "${ALERT_LOCS}" == "//var/log/exim/rejectlog" || "${ALERT_LOCS}" == "/var/log/directadmin/login.log" ]]; then
+            # /var/log/secure ---> bruteforce attack | 'invalid user' --TODO get this string so that we can identify correct category not just assumption
+            # /var/log/maillog" ---> bruteforce attack | 'pop3-login'   -- because i don't have pop3 enable-
+            # /var/www/html/roundcube/logs/errors.log ---> bruteforce attack | 'Login failed for'
+            # /var/www/html/phpMyAdmin/log/auth.log ---> confirmed bruteforce attack if triggered
+            # /var/log/exim/mainlog --> bruteforce attack | 'login authenticator failed'
+            # /var/log/exim/rejectlog --> bruteforce attack | 'rejected EHLO or HELO' | 'login authenticator failed'
+            # /var/log/directadmin/login.log ----> confirmed bruteforce attack fi triggered
+            if [ "${attack_status}" == "0" ]; then
+              attack_status="18"
+            else
+              attack_status="$attack_status 18" # Bruteforce
+            fi
+          fi
+
+          # Web attack condition from log file
+          if [[ "${ALERT_LOCS}" == "/var/log/nginx/modsec_audit.log" || "${ALERT_LOCS}" == "/var/log/httpd/access_log" || "${ALERT_LOCS}" == "/var/log/httpd/error_log" || "${ALERT_LOCS}" == "/var/log/nginx/access_log" || "${ALERT_LOCS}" == "/var/log/nginx/error_log" || "${ALERT_LOCS}" == "/var/log/suricata/http.log" ]]; then
+            # /var/log/nginx/modsec_audit.log --> Confirm web application attack if triggered
+            # /var/log/httpd/access_log --> Confirm web application attack if triggered
+            # /var/log/httpd/error_log --> web application attack | 'Permission denied'
+            # /var/log/nginx/access_log --> confirm web application attack if triggered
+            # /var/log/nginx/error_log --> web application attack | 'ModSecurity' or 'wp-login.php'
+            # /var/log/suricata/http.log --> web application attack | 'author' | 'wp-login' | 'xmlrpc' | 'wp-admin'
+            if [[ "${ALERT_LOCS}" == "/var/log/nginx/modsec_audit.log" || "${ALERT_LOCS}" == *"/var/log/httpd/domains/"* || "${ALERT_LOCS}" == *"/var/log/nginx/domains/"* ]]; then
+              mod_sec="yes"
+            fi
+            if [ "${attack_status}" == "0" ]; then
+              attack_status="21"
+
+            else
+              attack_status="$attack_status 21" # Web application attack
+            fi
+
+          fi
+
+          if [ "${ALERT_LOCS}" == "/var/log/exim/rejectlog" ]; then
+            # /var/log/exim/rejectlog --> mail Spam | 'Email blocked' |  'sender verify fail'
+            if [ "${attack_status}" == "0" ]; then
+              attack_status="11"
+
+            else
+              attack_status="$attack_status 11" # Email Spam
+            fi
+          fi
+
+          {
+            echo "${path_count}) ${ALERT_INFO}"
+            echo "[${SCRIPT_NAME}]: Found this IP at: ${ALERT_LOCS}:"
+
+            echo "---------"
+            echo "[${SCRIPT_NAME}]: Latest 10 records:"
+            echo "---"
+            #cat "${TEMP_GREP}"
+            tail -10 "${TEMP_GREP}"
+            echo "---------"
+            echo ""
+          } >>"${SUSP_LOG_RPT}" # Use >> instead of >
+        fi
+      fi
+    done <"${ALERT_FILE}"
+    # Define new variable
+    echo "SUSP_LOG_COUNT: ${susp_log_count}" >>"${SUSP_LOG_RPT}" # Put that at the end of the log file
+    echo "MOD_SEC_STATUS: ${mod_sec}" >>"${SUSP_LOG_RPT}"
+    #cat "${SUSP_LOG_RPT}"
+    output=$(echo "$attack_status" | fmt -1 | sort | uniq | awk '{printf $1","}' | sed 's/,$//')
+    # Return the last output
+    echo "${output}"
+
+  fi
+  # Get the current MOD_SEC status (log must exist)
+  # Usage: maxicata -c is-mod-security-triggered
+  if [[ "${cmd}" == "is-mod-security-triggered" || "${cmd}" == "imst" ]]; then
+    local modsec_status
+    modsec_status=$(grep 'MOD_SEC_STATUS' "${SUSP_LOG_RPT}" | awk '{print $2}')
+    echo "${modsec_status}"
+  fi
+
+  # Get the current suspicious log count (the log must exist)
+  # Usage: maxicata -c get-susp-log-count
+  if [[ "${cmd}" == "get-susp-log-count" || "${cmd}" == "gslc" ]]; then
+    local status_count ret_val
+    status_count=$(grep 'SUSP_LOG_COUNT' "${SUSP_LOG_RPT}" | awk '{print $2}')
+    ret_val=$? # if return 1 , means no result, return 0 means has result
+    if [ "${ret_val}" = 0 ]; then
+      echo "${status_count}"
+    else
+      echo "0"
+    fi
+  fi
+
+  # Usage: maxicata -c get_src_ip_count <ip> <file>
+  # This function is used to read the total source or inbound count for suspicious activity of an IP
+  if [[ "${cmd}" == "get_src_ip_count" || "${cmd}" == "src_ip_count" ]]; then
+    local ip_address input_file chk_ip src_count
+    shift # remove cmd argument (start fresh)
+    ip_address="$1"
+    input_file="$2"
+    chk_ip=$(
+      ipcalc -c -s "${ip_address}"
+      echo $?
+    )
+    if [ "${chk_ip}" == 1 ]; then
+      echo "0" #Bad IP default result
+    else
+      src_count=$(grep -w "${ip_address}" "${input_file}" | awk '{ print $11 }' | grep -v 'LOCAL_IP' | uniq -c | awk '{ print $1 }')
+      if [ "${src_count}" == "" ]; then #
+        echo "0"
+      else
+        echo "${src_count}"
+      fi
+    fi
+  fi
+  # Usage: maxicata -c get-path <path>
+  # eg: maxicata -c get-path db-path-cache
+  if [ "${cmd}" == "get-path" ]; then
+    shift
+    path_name="$1"
+    if [ "${path_name}" == "script-path" ]; then
+      echo "${SCRIPT_PATH}"
+    fi
+    if [ "${path_name}" == "log-path" ]; then
+      echo "${LOG_PATH}"
+    fi
+    if [ "${path_name}" == "db-path" ]; then
+      echo "${DB_PATH}"
+    fi
+    if [ "${path_name}" == "db-path-cache" ]; then
+      echo "${DB_PATH_CACHE}"
+    fi
+    if [ "${path_name}" == "config-path" ]; then
+      echo "${CONFIG_PATH}"
+    fi
+    if [ "${path_name}" == "code-path" ]; then
+      echo "${CODE_PATH}"
+    fi
+    if [ "${path_name}" == "temp-path" ]; then
+      echo "${TEMP_PATH}"
+    fi
+    if [ "${path_name}" == "process-path" ]; then
+      echo "${PROCESS_PATH}"
+    fi
+  fi
+
+  # Deprecated -- will comment / delete later TODO
+  if [ "${cmd}" == "script-path" ]; then
+    echo "${SCRIPT_PATH}"
+  fi
+  if [ "${cmd}" == "log-path" ]; then
+    echo "${LOG_PATH}"
+  fi
+  if [ "${cmd}" == "db-path" ]; then
+    echo "${DB_PATH}"
+  fi
+  if [ "${cmd}" == "config-path" ]; then
+    echo "${CONFIG_PATH}"
+  fi
+  if [ "${cmd}" == "code-path" ]; then
+    echo "${CODE_PATH}"
+  fi
+  if [ "${cmd}" == "temp-path" ]; then
+    echo "${TEMP_PATH}"
+  fi
+  # End of deprecated
+
+  # Usage: maxicata -c get_dst_ip_count <ip> <file>
+  # This function is used to read the total destination or outbound count for suspicious activity of an IP
+  if [[ "${cmd}" == "get_dst_ip_count" || "${cmd}" == "dst_ip_count" ]]; then
+    local ip_address input_file chk_ip dst_count
+    shift # remove cmd argument (start fresh)
+    ip_address="$1"
+    input_file="$2"
+    chk_ip=$(
+      ipcalc -c -s "${ip_address}"
+      echo $?
+    )
+    if [ "${chk_ip}" == 1 ]; then
+      echo "0" #Bad IP default result
+    else
+      dst_count=$(grep -w "${ip_address}" "${input_file}" | awk '{ print $16 }' | grep -v 'LOCAL_IP' | uniq -c | awk '{ print $1 }')
+      if [ "${dst_count}" == "" ]; then #
+        echo "0"
+      else
+        echo "${dst_count}"
+      fi
+    fi
+  fi
+  # -----------------------------------------------------------------------------------------
+  # This will clear reported ip info cache and specify the duration
+  # Usage: maxicata -c clear-ip-info-cache <duration_in_seconds_ago>
+  # eg: maxicata -c clear-ip-info-cache 900, this will clear reported ip info cache 900 seconds ago
+  # output :
+  if [[ "${cmd}" == "clear-ip-info-cache" || "${cmd}" == "ciic" ]]; then
+    local clear_duration ip_list curr_timestamp success line rpt_ip rpt_timestamp diff ret_val
+    # remove cmd argument (start fresh)
+    shift
+    clear_duration="$1"
+    curr_timestamp=$(date +%s)
+    success=0
+    if [ -s "${AIPDB_IP_CACHED}" ]; then
+      ip_list=""
+      # shellcheck disable=SC2094
+      while read -r line; do
+        rpt_ip=$(echo "${line}" | awk '{print $2}')
+        rpt_timestamp=$(echo "${line}" | awk '{print $4}')
+        diff=$((curr_timestamp - rpt_timestamp))
+        if [ "${diff}" -ge "${clear_duration}" ]; then
+          # echo "${rpt_ip} has a timestamp over ${clear_duration} second(s)..."
+          # TODO Watch out for this sed, possible to delete 1.1.1.53 when timestamp match 1.1.1.5 ?
+
+          sed -i "/${rpt_ip}/d" "${AIPDB_IP_CACHED}"
+
+          #If return 0 means success, this also can return something else like 1 if sed error
+          ret_val=$?
+          if [ "${ret_val}" = 0 ]; then
+            # echo "Success, ${rpt_ip} has been removed from REPORTED IP"
+            ((success++))
+            if [ -z "${ip_list}" ]; then
+              ip_list="${rpt_ip}"
+            else
+              ip_list="${ip_list} ${rpt_ip}"
+            fi
+            #else
+            #echo "Warning, could not remove ${rpt_ip} from REPORTED IP. Error code: [$ret_val]"
+            #error=1
+          fi
+          ## echo "Notice, no IP found in REPORTED IP with expired timestamp over ${clear_duration} second(s)"
+          #ret_val=147 # My own return code 147, meaning no expired timestamp is found
+        fi
+      done <"${AIPDB_IP_CACHED}"
+    else
+      # echo "notice, reported ip cache file is empty at this moment"
+      success=0
+    fi
+    # Result should return one line only
+    if [[ "${success}" == 0 ]]; then
+      echo "Notice, no IP is removed from $(basename "${AIPDB_IP_CACHED}") at this moment"
+    elif [[ "${success}" == 1 ]]; then
+      echo "Notice, ${success} IP [${ip_list}] has been removed from $(basename "${AIPDB_IP_CACHED}")"
+    else
+      echo "Notice, ${success} IPs [${ip_list}] have been removed from $(basename "${AIPDB_IP_CACHED}")"
+    fi
+
+  fi
+
+  # -----------------------------------END---------------------------------------------------
+
+  # -----------------------------------------------------------------------------------------
+  # This will clear reported ip and specify the duration
+  # Usage: maxicata -c clear-ip-reported <duration_in_seconds_ago>
+  # eg: maxicata -c clear-ip-reported 900, this will clear reported ip cache 900 seconds ago
+  # output :
+  if [[ "${cmd}" == "clear-ip-reported-cache" || "${cmd}" == "circ" ]]; then
+    local clear_duration ip_list curr_timestamp success line rpt_ip rpt_timestamp diff ret_val
+    # remove cmd argument (start fresh)
+    shift
+    clear_duration="$1"
+    ip_list=""
+    curr_timestamp=$(date +%s)
+    success=0
+    if [ -s "${AIPDB_IP_REPORTED_CACHED}" ]; then
+      # shellcheck disable=SC2094
+      while read -r line; do
+        rpt_ip=$(echo "${line}" | awk '{print $2}')
+        rpt_timestamp=$(echo "${line}" | awk '{print $4}')
+        diff=$((curr_timestamp - rpt_timestamp))
+        if [ "${diff}" -ge "${clear_duration}" ]; then
+          # echo "${rpt_ip} has a timestamp over ${clear_duration} second(s)..."
+          # TODO Watch out for this sed, possible to delete 1.1.1.53 when timestamp match 1.1.1.5 ?
+          sed -i "/${rpt_ip}/d" "${AIPDB_IP_REPORTED_CACHED}"
+          if [ -n "${rpt_ip}" ]; then
+            ip_list="${ip_list} ${rpt_ip}"
+          else
+            ip_list="${rpt_ip}"
+          fi
+          #If return 0 means success, this also can return something else like 1 if sed error
+          ret_val=$?
+          if [ "${ret_val}" = 0 ]; then
+            # echo "Success, ${rpt_ip} has been removed from REPORTED IP"
+            ((success++))
+            #else
+            #echo "Warning, could not remove ${rpt_ip} from REPORTED IP. Error code: [$ret_val]"
+            #error=1
+          fi
+          ## echo "Notice, no IP found in REPORTED IP with expired timestamp over ${clear_duration} second(s)"
+          #ret_val=147 # My own return code 147, meaning no expired timestamp is found
+        fi
+      done <"${AIPDB_IP_REPORTED_CACHED}"
+    else
+      # echo "notice, reported ip cache file is empty at this moment"
+      success=0
+    fi
+    # Result should return one line only
+    if [[ "${success}" == 0 ]]; then
+      echo "Notice, no IP is removed from $(basename "${AIPDB_IP_REPORTED_CACHED}") at this moment"
+    elif [[ "${success}" == 1 ]]; then
+      echo "Notice, ${success} IP [${ip_list}] has been removed from $(basename "${AIPDB_IP_REPORTED_CACHED}")"
+    else
+      echo "Notice, ${success} IPs [${ip_list}] have been removed from $(basename "${AIPDB_IP_REPORTED_CACHED}")"
+    fi
+  fi
+  # -----------------------------------END---------------------------------------------------
+
+  # Usage: maxicata -c is-ip-whitelisted <ip>
+  # Deprecated:::
+  if [[ "${cmd}" == "is-ip-whitelisted" || "${cmd}" == "iis" ]]; then
+    shift
+    local ip_add="$1"
+    local check_sip
+    check_sip=$(grep -w "[^.0-9a-fA-F]${ip_add}[^.0-9a-fA-F]" "${WHITELISTED_IP}")
+    # If IP is in the cached file, then just display error
+    if [[ -n "${check_sip}" ]]; then #0 means yes
+      echo "0"
+    else # 1 means no
+      echo "1"
+    fi
+
+  fi
+  if [[ "${cmd}" == "suppress-ip" || "${cmd}" == "sip" ]]; then
+    :
+  fi
+
+  if [[ "${cmd}" == "suppress-gsr" || "${cmd}" == "sgsr" ]]; then
+    :
+  fi
+
+  if [[ "${cmd}" == "suppress-msg" || "${cmd}" == "smsg" ]]; then
+    :
+  fi
+
+  # maxicata -c grep-ip-from-file <ip_add> <input_file> <optional_existing_output_file>
+  if [[ "${cmd}" == "grep-ip-from-file" || "${cmd}" == "giff" ]]; then
+    shift
+    local ip_add="$1"
+    local input_file="$2"
+    # This file must be exist, if don't specify this, it will just print the output
+    local existing_output_file="$3"
+    local check_sip
+
+    check_sip=$(grep -w "[^.0-9a-fA-F]${ip_add}[^.0-9a-fA-F]" "${input_file}")
+
+    if [[ -n "${existing_output_file}" && -f "${existing_output_file}" ]]; then
+      # Only if there is a result from grep then we write the result to existing file
+      if [[ -n "${check_sip}" ]]; then
+        echo "Writing grep result to ${existing_output_file} ... "
+        echo "${check_sip}" >>"${existing_output_file}"
+      else
+        echo "Grep result is empty"
+      fi
+    else
+      echo "Error, existing output file isn't specify or is not a valid file"
+      if [[ -n "${check_sip}" ]]; then
+        echo "Displaying the grep result ..."
+        echo "${check_sip}"
+      else
+        echo "Grep result is empty"
+      fi
+    fi
+  fi
+
+  # Same as above but quite mode and output is mandatory
+  # maxicata -c grep-ip-from-file-q <ip_add> <input_file> <mandatory_output_file>
+  if [[ "${cmd}" == "grep-ip-from-file-q" || "${cmd}" == "giff-q" ]]; then
+    shift
+    local ip_add="$1"
+    local input_file="$2"
+    # This file must be exist, if don't specify this, it will just print the output
+    local existing_output_file="$3"
+    local check_sip
+    if [ -z "${existing_output_file}" ]; then
+      echo "1"
+      exit 1
+    fi
+    check_sip=$(grep -w "[^.0-9a-fA-F]${ip_add}[^.0-9a-fA-F]" "${input_file}")
+    if [[ -n "${existing_output_file}" && -f "${existing_output_file}" ]]; then
+      # Only if there is a result from grep then we write the result to existing file
+      if [ -n "${check_sip}" ]; then
+        echo "${check_sip}" >>"${existing_output_file}"
+        echo "0"
+      else
+        echo "1"
+      fi
+    else
+      echo "1"
+    fi
+  fi
+
+  # Calculate IP for CIDR 24 TODO CIDR 16
+  if [[ "${cmd}" == "cidr24-count" || "${cmd}" == "cidr24-c" ]]; then
+    shift
+    twentyfour_ips="${TEMP_PATH}/twentyfour_ips_temp"
+    twentyfour_ips_uniq="${TEMP_PATH}/twentyfour_ips_uniq_temp"
+    touch "${twentyfour_ips}"
+    touch "${twentyfour_ips_uniq}"
+    ip_add="$1"
+    oc1=$(echo "${ip_add}" | cut -d '.' -f 1)
+    oc2=$(echo "${ip_add}" | cut -d '.' -f 2)
+    oc3=$(echo "${ip_add}" | cut -d '.' -f 3)
+    ip="${oc1}.${oc2}.${oc3}.0/24"
+    #echo "${ip}"
+    #echo "======================"
+
+    cat /dev/null >"${twentyfour_ips}"
+    cat /dev/null >"${twentyfour_ips_uniq}"
+    bad_ips=$(awk '{ print $1 }' "${CSF_IP_PERM_DENY}" | grep -v '^\s*$\|^\s*\#')
+    echo "${bad_ips}" | while read -r line; do
+      oc1=$(echo "${line}" | cut -d '.' -f 1)
+      oc2=$(echo "${line}" | cut -d '.' -f 2)
+      oc3=$(echo "${line}" | cut -d '.' -f 3)
+      echo "${oc1}.${oc2}.${oc3}.0/24" >>"${twentyfour_ips}"
+    done
+    sorted=$(awk '{print $1}' "${twentyfour_ips}" | sort | uniq -c | grep "${ip}" | awk '{print $1}')
+    if [ -z "${sorted}" ]; then
+      echo "0"
+    else
+      echo "${sorted}"
+    fi
+  fi
+  # Deprecated
+  #if [[ "${cmd}" == "maxiscan-bl-count" || "${cmd}" == "scan-bl-count" ]]; then
+  #  local ip
+  ##  shift # remove cmd argument
+  #  ip="$1"
+  #  maxirbl "${ip}" | grep 'Blacklisted' | awk '{ print $2 }'
+  #fi
+
+  # Deprecated 2
+  # maxicata -c grep-susp-log 1.1.1.1 /var/log/test.log
+  #if [ "${cmd}" == "grep-susp-log" ]; then
+  #  local ip path
+  #  # remove cmd argument (start fresh)
+  #  shift
+  ##  ip="$1"
+  # path="$2"
+  # grep -w "${ip}" "${path}"
+  #fi
+}
+
+function clearlog() {
+  echo "[${SCRIPT_NAME}]: Clearing suricata log files ..."
+  cat /dev/null >"${MAXICATA_LOG_YN}"
+  cat /dev/null >"/var/log/suricata/suricata.log"
+  cat /dev/null >"/var/log/suricata/estats.log"
+  cat /dev/null >"/var/log/suricata/stats.log"
+  cat /dev/null >"/var/log/suricata/fast.log"
+  cat /dev/null >"/var/log/suricata/http.log"
+  cat /dev/null >"/var/log/suricata/eve.json"
+  cat /dev/null >"/var/log/suricata/maxicata_http.log"
+  cat /dev/null >"/var/log/suricata/maxicata.log"
+  cat /dev/null >"/var/log/suricata/maxicata-yn.log"
+  cat /dev/null >"/var/log/suricata/maxicata-y.log"
+  cat /dev/null >"/var/log/suricata/maxicata-y-mail.log"
+  cat /dev/null >"/var/log/suricata/maxicata-n.log"
+  cat /dev/null >"/var/log/suricata/maxicata-n-limit.log"
+  cat /dev/null >"/var/log/suricata/maxicata-n-mail.log"
+  cat /dev/null >"/var/log/suricata/maxicata-s-mail.log"
+  echo "[${SCRIPT_NAME}]: Suricata log files cleared"
+}
+
+function clear_ipcache() {
+  echo "[${SCRIPT_NAME}]: Clearing IP address info cache ..."
+  cat /dev/null >"${AIPDB_IP_CACHED}"
+  echo "[${SCRIPT_NAME}]: IP address info cache cleared"
+}
+
+function clear_blcache() {
+  echo "[${SCRIPT_NAME}]: Clearing IP address blacklist cache ..."
+  cat /dev/null >"${RBL_BLACKLISTED_IP_CACHED}"
+  echo "[${SCRIPT_NAME}]: IP address blacklist cache cleared"
+}
+
+function clear_cache() { # Clear all the cache file
+  echo "[${SCRIPT_NAME}]: Clearing cache database ..."
+  cat /dev/null >"${AIPDB_IP_CACHED}"
+  cat /dev/null >"${AIPDB_IP_REPORTED_CACHED}"
+  cat /dev/null >"${RBL_BLACKLISTED_IP_CACHED}"
+  cat /dev/null >"${PFLAG}"
+  echo "[${SCRIPT_NAME}]: Database Cache cleared"
+}
+
+function clear_rbl_scan() {
+  echo "[${SCRIPT_NAME}]: Clearing pending RBL-blacklist scan ... "
+  rm -f "${IP_SCAN_PDIR}"/*
+  echo "[${SCRIPT_NAME}]: Pending RBL-blacklist scan cleared "
+}
+
+function clear_rule() {
+  echo "[${SCRIPT_NAME}]: Clearing config rules ..."
+  cat /dev/null >"${SUPPRESSED_IP}"
+  cat /dev/null >"${WHITELISTED_IP}"
+  cat /dev/null >"${IGNORED_IP}"
+  cat /dev/null >"${SUPPRESSED_MSG}"
+  echo "[${SCRIPT_NAME}]: Config rules cleared"
+}
+
+function clear_csf_deny() {
+  echo "[${SCRIPT_NAME}]: Clearing CSF permanent deny list ..."
+  # Didn't know this one exist.
+  csf -df >/dev/null
+  #csf -x >/dev/null
+  #cp -p "${CODE_PATH}/etc/csf/csf.deny_original" "/etc/csf/csf.deny"
+  #echo "[${SCRIPT_NAME}]: Restarting CSF and LFD..."
+  # No need to restart because csf -df already did
+  #csf -ra >/dev/null
+  echo "[${SCRIPT_NAME}]: CSF permanent deny list cleared"
+}
+
+function runstatus() {
+  local suri_service suri_interface csf_service csf_entry_count csf_entry_grammar suri_script_err
+  local aipdb_cache_count sip_entry_count smsg_entry_count wip_entry_count bip_cache_count rip_cache_count
+  echo "[${SCRIPT_NAME}]: ${APP_SPECIFIC_NAME} status:"
+  echo "------------"
+  suri_service=$(systemctl is-active suricata)
+  csf_service=$(systemctl is-active csf)
+  csf_entry_count=$(grep -v '^\s*$\|^\s*\#' -c "${CSF_IP_PERM_DENY}")
+  csf_entry_grammar="entry"
+  aipdb_cache_count=$(wc -l <"${AIPDB_IP_CACHED}")
+  rip_cache_count=$(wc -l <"${AIPDB_IP_REPORTED_CACHED}")
+  bip_cache_count=$(wc -l <"${RBL_BLACKLISTED_IP_CACHED}")
+
+  sip_entry_count=$(wc -l <"${SUPPRESSED_IP}")
+  smsg_entry_count=$(wc -l <"${SUPPRESSED_MSG}")
+  wip_entry_count=$(wc -l <"${WHITELISTED_IP}")
+  iip_entry_count=$(wc -l <"${IGNORED_IP}")
+
+  # This yn entry might contain blank line so use sed
+  maxicata_yn_entry_count=$(grep -c -v -e '^[[:space:]]*$' "${MAXICATA_LOG_YN}")
+  maxicata_y_entry_count=$(grep -c -v -e '^[[:space:]]*$' "${MAXICATA_LOG_Y}")
+  maxicata_n_entry_count=$(grep -c -v -e '^[[:space:]]*$' "${MAXICATA_LOG_N}")
+
+  #TODO running uptime (since)
+
+  suri_interface=$(grep -c -m2 -w 'All AFP capture threads are running' "${SURICATA_SYSTEM_LOG}")
+  suri_script_err=$(grep -m1 -w '<Info> - failed to run script:' "${SURICATA_SYSTEM_LOG}")
+  # TODO Must make sure to remind to enable log verbose to capture this thing (need to test):
+  suri_process_error=$(grep -m1 -w '<Error>' "${SURICATA_SYSTEM_LOG}")
+
+  #echo "$suri_interface"
+  #exit 1
+  if [ "${suri_service}" != "active" ]; then
+    suri_interface="Waiting for suricata process to active ..."
+  elif [ "${suri_interface}" = 1 ]; then
+    suri_interface="All AFP capture threads are running (1-OK)"
+  elif [ "${suri_interface}" = 2 ]; then
+    suri_interface="All AFP capture threads are running (2-Restarted)"
+  else
+    suri_interface="Detecting ..."
+  fi
+
+  if [ -n "${suri_script_err}" ]; then
+    suri_script_err="Error, found one or more script errors"
+  else
+    suri_script_err="OK"
+  fi
+
+  if [ -n "${suri_process_error}" ]; then
+    suri_process_error="Warning, found critical error in log"
+  else
+    suri_process_error="OK"
+  fi
+
+  if [ "${csf_entry_count}" = 1 ]; then
+    csf_entry_grammar="entry"
+  else
+    csf_entry_grammar="entries"
+  fi
+
+  echo "[${SCRIPT_NAME}]: Suricata running process status: ${suri_service^}"
+  echo "[${SCRIPT_NAME}]: Suricata network capture log status: ${suri_interface}"
+  echo "[${SCRIPT_NAME}]: Suricata log status: ${suri_process_error}"
+  echo "[${SCRIPT_NAME}]: Maxicata script status: ${suri_script_err}"
+  echo "[${SCRIPT_NAME}]: Maxicata total critical and non-critical IP record(s): ${maxicata_yn_entry_count}"
+  echo "[${SCRIPT_NAME}]: Maxicata total critical IP record(s): ${maxicata_y_entry_count}/${maxicata_yn_entry_count}"
+  echo "[${SCRIPT_NAME}]: Maxicata total non-critical IP record(s): ${maxicata_n_entry_count}/${maxicata_yn_entry_count}"
+  echo "[${SCRIPT_NAME}]: CSF running status: ${csf_service^} (with ${csf_entry_count} blocked ${csf_entry_grammar})"
+
+  echo ""
+  echo "[${SCRIPT_NAME}]: Rule Entry Record:"
+  echo "---"
+  echo "[${SCRIPT_NAME}]: Suppressed IP total entry: ${sip_entry_count}"
+  echo "[${SCRIPT_NAME}]: Suppressed message total entry: ${smsg_entry_count}"
+  echo "[${SCRIPT_NAME}]: Whitelisted IP total entry: ${wip_entry_count}"
+  echo "[${SCRIPT_NAME}]: Ignored IP total entry: ${iip_entry_count}"
+  echo ""
+  echo "[${SCRIPT_NAME}]: Cache Entry Record:"
+  echo "---"
+  echo "[${SCRIPT_NAME}]: AIPDB IP total cache entry: ${aipdb_cache_count}"
+  echo "[${SCRIPT_NAME}]: AIPDB web reported IP total cache entry: ${rip_cache_count}"
+  echo "[${SCRIPT_NAME}]: RBL blacklisted IP total cache entry: ${bip_cache_count}"
+  echo ""
+  echo "[${SCRIPT_NAME}]: AIPDB status:"
+  echo "---"
+  if [ "$(curl -LI "${AIPDB_CHECK_URL}" -o /dev/null -w '%{http_code}\n' -s)" != "200" ]; then
+    aipdb_check_api_status="Warning: Offline"
+  else
+    aipdb_check_api_status="Online"
+  fi
+
+  if [ "$(curl -LI "${AIPDB_REPORT_URL}" -o /dev/null -w '%{http_code}\n' -s)" != "200" ]; then
+    aipdb_report_api_status="Warning: Offline"
+  else
+    aipdb_report_api_status="Online"
+  fi
+  echo "[${SCRIPT_NAME}]: AIPDB API 'CHECK' status: ${aipdb_check_api_status}"
+  echo "[${SCRIPT_NAME}]: AIPDB API 'REPORT' status: ${aipdb_report_api_status}"
+  echo "------------"
+
+  if [ "${suri_service}" == "deactivating" ]; then
+    echo "Suricata process status is still deactivating. Please wait a few moment before starting or stopping suricata"
+    exit 1
+  fi
+
+  if [ "${suri_service}" == "activating" ]; then
+    echo "Suricata process status is still activating. Please wait a few moment before starting or stopping suricata"
+    exit 1
+  fi
+
+  if [ "${suri_service}" == "failed" ]; then
+    echo "Suricata process status is already stopped (status=failed)"
+    exit 1
+  fi
+
+}
+# Usage: maxicata -i <IP>
+function ipinfo() {
+  echo "[${SCRIPT_NAME}]: Checking IP [${ip_add}] information ..." # Debug
+  local ip_add="$1"
+  # TODO ADD THIS IN TEMP FOLDER WITH EXTENSION TOO
+  local CHECK_IP_TMP="$LOG_PATH/${SCRIPT_NAME}-CHECK_IP_TMP-${RANDSTR}.log"
+  # TODO ADD THIS IN TEMP FOLDER, WITH EXTENSION TOO
+  local CHK_IP_GREP="$LOG_PATH/${SCRIPT_NAME}-CHK_IP_GREP-${RANDSTR}.log"
+  touch "${CHECK_IP_TMP}"
+  touch "${CHK_IP_GREP}"
+  local RET_VAL
+  local aipdb_cached="new"
+  local aipdb_ip aipdb_iswhitelisted aipdb_abuse_score aipdb_isp aipdb_usage_type aipdb_domain aipdb_country_name
+  local aipdb_country_code aipdb_total_report aipdb_distinct_report aipdb_last_report aipdb_time check_ip_cached
+
+  local src_ip_c dst_ip_c src_dst_c countloc
+
+  check_ip_cached=$(${SCRIPT_NAME} -c is-aipdb-ip-cached "${ip_add}")
+  if [ "${check_ip_cached}" = 1 ]; then
+    ${SCRIPT_NAME} -c aipdb-cache-ipinfo "${ip_add}"
+    aipdb_cached="new"
+  else
+    aipdb_cached="cached"
+  fi
+  aipdb_ip=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'ip')
+  aipdb_iswhitelisted=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'iswhitelisted')
+  aipdb_abuse_score=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'abuse_score')
+  aipdb_isp=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'isp')
+  aipdb_usage_type=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'usage_type')
+  aipdb_domain=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'domain')
+  aipdb_country_name=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'country_name')
+  aipdb_country_code=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'country_code')
+  aipdb_total_report=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'total_report')
+  aipdb_distinct_report=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'distinct_report')
+  aipdb_last_report=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'last_report')
+  aipdb_time=$(${SCRIPT_NAME} -c aipdb-get-cached-var "${ip_add}" 'time')
+
+  #echo "${aipdb_ip} ${aipdb_iswhitelisted} ${aipdb_abuse_score} ${aipdb_isp} ${aipdb_usage_type} ${aipdb_domain} ${aipdb_country_name} ${aipdb_country_code} ${aipdb_total_report} ${aipdb_distinct_report} ${aipdb_last_report} ${aipdb_time}"
+  #echo ""
+
+  src_ip_c=$(grep "${ip_add}" "${MAXICATA_LOG_YN}" | awk '{ print $11 }' | grep -v "LOCAL_IP" | uniq -c | awk '{ print $1 }')
+  dst_ip_c=$(grep "${ip_add}" "${MAXICATA_LOG_YN}" | awk '{ print $16 }' | grep -v "LOCAL_IP" | uniq -c | awk '{ print $1 }')
+
+  if [ -z "${src_ip_c}" ]; then
+    src_ip_c=0
+  fi
+  if [ -z "${dst_ip_c}" ]; then
+    dst_ip_c=0
+  fi
+  src_dst_c=$((src_ip_c + dst_ip_c))
+
+  #echo "${src_ip_c} | ${dst_ip_c} | ${src_dst_c}"
+  {
+    echo "-----------------------------"
+    echo "Domain Name/Country Code/ISP/Usage Type: ${domain}/${country_code}/${isp}/${usage_type}"
+    echo "IP Whitelisted?: ${iswhitelisted}"
+    echo "*---*"
+    echo "This IP address has been reported a total of ${total_report} time(s) from ${num_distinct_user} distinct sources. ${ip} most recent report was at [${last_reported_at}]"
+    echo "More info at: https://www.abuseipdb.com/check/${ip}"
+    echo "*---*"
+    echo ""
+    echo "Last activity recorded:"
+
+    echo "[${SCRIPT_NAME}]: IP information IP from ${ip_add}/${aipdb_country_name}:"
+    echo "---------------------"
+    echo "AbuseIPDB Security Info: [${aipdb_cached} IP Info since: $(date -d @"${aipdb_time}")] "
+    echo "---------------------"
+    echo "Abuse Confidence Score: ${aipdb_abuse_score}%"
+    echo "is IP whitelisted?: ${aipdb_iswhitelisted}"
+    echo "ISP/Usage Type/Domain Name: ${aipdb_isp}/${aipdb_usage_type}/${aipdb_domain}"
+    echo "Country Name/Code: ${aipdb_country_name}/${aipdb_country_code}"
+    echo "*---*"
+    echo "This IP address has been reported a total of ${aipdb_total_report} time(s) from ${aipdb_distinct_report} distinct sources. ${aipdb_ip} most recent report was on [${aipdb_last_report}]. More info at: https://www.abuseipdb.com/check/${ip_add}"
+    echo "*---*"
+    echo ""
+    echo "---------------------"
+    echo "Suricata Security Info:"
+    echo "---------------------"
+    echo "Source/Inbound(${src_dst_c}) + Destination/Outbound(${dst_ip_c}) = ${src_dst_c} record(s)"
+    echo "Blacklist SPAM count: [TODO]"
+    echo "Suspicious Log Count: [TODO]"
+
+    echo "---------------------"
+    echo "Suspicious IP web references:"
+    echo "---------------------"
+    echo "1) https://www.abuseipdb.com/check/${ip_add}"
+    echo "2) https://www.ipqualityscore.com/ip-reputation-check/lookup/${ip}"
+    echo "3) https://stopforumspam.com/ipcheck/${ip_add}"
+    echo "4) https://www.spamhaus.org/query/ip/${ip_add}"
+    echo "------------"
+    echo "[${SCRIPT_NAME}]: History of suspicious activities from ${ip_add}/${aipdb_country_name} [ALERT: Y]:"
+    echo "------------"
+    grep "${ip_add}" "${MAXICATA_LOG_Y}"
+    echo "------------"
+    echo ""
+    echo "[${SCRIPT_NAME}]: History of suspicious activities from ${ip_add}/${aipdb_country_name} [ALERT: N]:"
+    echo "------------"
+    grep "${ip_add}" "${MAXICATA_LOG_N}"
+    echo "------------"
+  } >>"${CHECK_IP_TMP}"
+
+  countloc=0
+  while read -r ALERT_LOCS ALERT_INFO; do
+    grep -F "${ip_add}" "${ALERT_LOCS}" >"${CHK_IP_GREP}"
+    RET_VAL=$?
+    if [ ${RET_VAL} = 0 ]; then
+      ((countloc++))
+      {
+        echo "${countloc}) ${ALERT_INFO}"
+        echo "---------"
+        echo "[${SCRIPT_NAME}]: Found this IP at: ${ALERT_LOCS}:"
+        cat "${CHK_IP_GREP}"
+        echo "---------"
+        echo ""
+      } >>"${CHECK_IP_TMP}" # Use >> instead of >
+    fi
+  done <"${ALERT_FILE}"
+
+  cat "${CHECK_IP_TMP}"
+  $MAIL_BIN -s "[${SCRIPT_NAME} -i]: Information about IP address: [${ip_add}]" "${ADMIN_EMAIL}" <"${CHECK_IP_TMP}"
+
+  rm -f "${CHECK_IP_TMP}"
+  rm -f "${CHK_IP_GREP}"
+}
+function runtime() {
+  #Usage: runtime "start" or runtime "end"
+  local PARAM1="$1"   #OPTION - start / end
+  local RPT_TEMP="$2" #REPORT_FILE name eg: EXTERNAL_REPORT
+  local run_start run_since run_end
+  local dt dd dt2 dh dt3 dm ds
+  if [ "$PARAM1" == "start" ]; then
+    run_start=$(date +%s.%N)
+    run_since="$(date '+%d/%m/%Y %T %p')"
+  fi
+  if [ "$PARAM1" == "end" ]; then
+    run_end=$(date +%s.%N)
+    dt=$(echo "$run_end - $run_start" | bc)
+    dd=$(echo "$dt/86400" | bc)
+    dt2=$(echo "$dt-86400*$dd" | bc)
+    dh=$(echo "$dt2/3600" | bc)
+    dt3=$(echo "$dt2-3600*$dh" | bc)
+    dm=$(echo "$dt3/60" | bc)
+    ds=$(echo "$dt3-60*$dm" | bc)
+
+    if [ -n "${RPT_TEMP}" ]; then
+      # Use standard output if no file argument is supplied
+      if [ "${RPT_TEMP}" == "ALERT_REPORT_RATE" ]; then
+        LC_NUMERIC=C printf "[${SCRIPT_NAME}]: Total runtime: [%d:%02d:%02d:%02.4f] since [${run_since}]\n" "$dd" "$dh" "$dm" "$ds" >>"${ALERT_REPORT_RATE}"
+      # Another if else here
+      fi
+    else
+      # Redirect to file output
+      # RPT_TEMP="$LOG_PATH/${SCRIPT_NAME}-RPT_TEMP-${RANDSTR}.log"
+      #touch "${RPT_TEMP}"
+      LC_NUMERIC=C printf "[${SCRIPT_NAME}]: Total runtime: [%d:%02d:%02d:%02.4f] since [${run_since}]\n" "$dd" "$dh" "$dm" "$ds"
+      # rm -f "${RPT_TEMP}"
+    fi
+  fi
+}
+function initconfig() {
+  mkdir -p /etc/suricata/lua-output
+  echo "[${SCRIPT_NAME}]: Copying configuration file from ${CODE_PATH}${SURICATA_CONF} into ${SURICATA_CONF} ..."
+  cp -pf "${CODE_PATH}${SURICATA_CONF}" "${SURICATA_CONF}"
+  echo "[${SCRIPT_NAME}]: Copying script file from ${CODE_PATH}${MAXICATA_LUA} into ${MAXICATA_LUA} ..."
+  cp -pf "${CODE_PATH}${MAXICATA_LUA}" "${MAXICATA_LUA}"
+  echo "[${SCRIPT_NAME}]: Copying script file from ${CODE_PATH}/etc/suricata/lua-output/maxicata-http.lua into /etc/suricata/lua-output/maxicata-http.lua ..."
+  cp -pf "${CODE_PATH}/etc/suricata/lua-output/maxicata-http.lua" /etc/suricata/lua-output/maxicata-http.lua
+  echo "[${SCRIPT_NAME}]: Copying script file from ${CODE_PATH}/etc/systemd/system/suricata.service into /etc/systemd/system/suricata.service ..."
+  #cp -pf "${CODE_PATH}/etc/systemd/system/suricata.service" /etc/systemd/system/suricata.service
+  #echo "[${SCRIPT_NAME}]: Configuration files and scripts updated"
+
+  # Pending Other config
+}
+function init() {
+  echo "[${SCRIPT_NAME}]: Stopping suricata process ... "
+  stop_suricata
+  if test -f "${SURICATA_PID}"; then
+    rm "${SURICATA_PID}"
+  fi
+  pkill -f "suricata"
+  clear_cache
+  clear_rbl_scan
+  clearlog
+  initconfig
+  # suricata-update
+  start_suricata
+
+}
+
+function init_full() {
+
+  stop_suricata
+  clearlog
+  clear_cache
+  clear_rbl_scan
+  clear_rule
+  #echo "[${SCRIPT_NAME}]: Copying new configuration and script files ..."
+  initconfig
+  start_suricata
+  configure_suricata_rules
+  update_suricata
+  clear_csf_deny
+  runstatus
+
+}
+
+function configure_suricata_rules() {
+  echo "[${SCRIPT_NAME}]: Enabling suricata 3rd party rules ..."
+  sleep 1
+  suricata-update enable-source sslbl/ssl-fp-blacklist
+  suricata-update enable-source ptresearch/attackdetection
+  suricata-update enable-source etnetera/aggressive
+  suricata-update enable-source oisf/trafficid
+  suricata-update enable-source sslbl/ja3-fingerprints
+  suricata-update enable-source et/open
+  suricata-update add-source timon-rules/cybergon https://gitlab.com/cybergon/timon-rules/raw/master/cybergon.rules
+  echo "[${SCRIPT_NAME}]: Updating suricata new 3rd party source rules ..."
+  sleep 1
+  suricata-update update-sources
+}
+
+function update_suricata() {
+
+  echo "[${SCRIPT_NAME}]: Updating suricata rules ..."
+  # Don't display the duplicated rule SID which is too long for 3rd party rules
+  suricata-update 2>&1 | grep -v 'Found duplicate rule SID'
+  echo "[${SCRIPT_NAME}]: Suricata update completed"
+}
+function start_suricata() {
+  local service_name service_conf
+  echo "[${SCRIPT_NAME}]: Starting suricata process ... "
+  #${SURICATA_BIN} --af-packet -vvv -D -c "${SURICATA_CONF}" --pidfile "${SURICATA_PID}"
+  service_name="suricata.service"
+  service_conf="/etc/systemd/system/${service_name}"
+  if [ ! -f "${service_conf}" ]; then
+    cp "${CODE_PATH}/${service_conf}" "${service_conf}"
+    systemctl daemon-reload
+  fi
+  systemctl start ${service_name}
+
+}
+
+function stop_suricata() {
+  local service_name
+  echo "[${SCRIPT_NAME}]: Stopping and killing suricata process with its PID ... "
+  # TODO check if suricata has stopped then why need to run stop?
+  # Remove service to prevent auto load
+  # suricata.service can be edited at conf/suricata.service
+  service_name="suricata.service"
+  #service_conf="/etc/systemd/system/${service_name}"
+
+  # if [ -f "${service_conf}" ]; then
+  #  systemctl stop ${service_name}
+  #  systemctl disable ${service_name}
+  #  rm -f "${service_conf}"
+  #  systemctl daemon-reload
+  #fi
+  #systemctl reset-failed
+
+  #rm -f "${SURICATA_PID}"
+  #pkill -f "suricata"
+  systemctl stop ${service_name}
+  echo "[${SCRIPT_NAME}]: Suricata has been terminated!"
+  cp "${SURICATA_SYSTEM_LOG}" "${LOG_PATH}/suricata.log"
+}
+
+function start() {
+
+  start_suricata
+}
+
+function stop() {
+
+  stop_suricata
+  #if test -f "${SURICATA_PID}"; then
+  #  rm "${SURICATA_PID}"
+  #fi
+  #pkill -f "suricata"
+  # Copy the suricata log for review
+
+  # Debug dont clear log
+  # clearlog
+}
+
+function pause() {
+  # Just don't clear the log
+  stop_suricata
+}
+
+# SYSTEM VARIABLE, FILE AND BINARY
+SCRIPT_NAME=$(basename -- "$0")
+#PID_CACHE_FILE="/var/run/${SCRIPT_NAME}.pid"
+SURICATA_PID="/var/run/suricata.pid"
+#SURICATA_BIN=$(command -v suricata)
+SURICATA_CONF="/etc/suricata/suricata.yaml"
+DATE_BIN=$(command -v date)
+# Generate random string based on date
+RANDSTR="$(${DATE_BIN} '+%d-%m-%Y_%H-%M-%S').${RANDOM}"
+MAIL_BIN=$(command -v mail)
+#BOX_HOSTNAME=$(hostname)
+# SCRIPT STATUS
+#SSTAT="OK"
+# == Automatic install missing components ====
+missing_count=0
+install_success=0
+# List out required components here:
+required_cmds=("date" "mail" "ipcalc" "bc" "jq" "gawk")
+for required_cmd in "${required_cmds[@]}"; do
+  if ! command -v "${required_cmd}" &>/dev/null; then
+    ((missing_count++))
+    echo "Warning, missing ${required_cmd} component. Installing ${required_cmd} ..."
+    # Debian
+    apt-get -y install "${required_cmd}"
+    retval=$?
+    if [[ ${retval} -eq 0 ]]; then
+      ((install_success++))
+    fi
+  fi
+done
+if [ "${missing_count}" -gt 0 ]; then
+  echo "There were ${missing_count} missing component(s) to run ${SCRIPT_NAME} and ${install_success} component(s) was/were successfully installed!"
+fi
+# ================================================
+
+# DEFAULT PATH LOCATIONS
+SCRIPT_PATH="$(dirname "$(readlink -f "$0")")"
+LOG_PATH="${SCRIPT_PATH}/log/"
+CONFIG_PATH="${SCRIPT_PATH}/conf"
+DB_PATH="${SCRIPT_PATH}/db"
+TEMP_PATH="${SCRIPT_PATH}/tmp"
+CODE_PATH="${SCRIPT_PATH}/code"
+PROCESS_PATH="${SCRIPT_PATH}/process"
+mkdir -p "${LOG_PATH}"
+mkdir -p "${CONFIG_PATH}"
+mkdir -p "${DB_PATH}"
+mkdir -p "${TEMP_PATH}"
+mkdir -p "${CODE_PATH}"
+mkdir -p "${PROCESS_PATH}"
+# USER SPECIFIC CONFIGURATION
+ADMIN_EMAIL="webmaster@sofibox.com"
+APP_SPECIFIC_NAME="Maxicata"
+
+# APPLICATION SPECIFIC CONFIGURATION
+AWK_SEARCH_P="${CODE_PATH}/srch.awk"
+#touch "${AWK_SEARCH_P}"
+# If empty write default code
+if [ ! -f "${AWK_SEARCH_P}" ]; then
+  echo "[${SCRIPT_NAME}]: Error, [AWK_SEARCH_P] code does not exist! "
+  exit 1
+fi
+MAXICATA_LUA="/etc/suricata/lua-output/maxicata.lua"
+CSF_IP_PERM_DENY="/etc/csf/csf.deny"
+SURICATA_SYSTEM_LOG="/var/log/suricata/suricata.log"
+MAXICATA_LOG_YN="/var/log/suricata/maxicata-yn.log"
+MAXICATA_LOG_Y="/var/log/suricata/maxicata-y.log"
+MAXICATA_LOG_N="/var/log/suricata/maxicata-n.log"
+#MAXICATA_LOG_N_LIMIT="/var/log/suricata/maxicata-n.log"
+SUSP_LOG_RPT="$LOG_PATH/${SCRIPT_NAME}-SUSP_LOG_RPT.log"
+touch "${SUSP_LOG_RPT}"
+TEMP_GREP="$LOG_PATH/${SCRIPT_NAME}-TEMP_GREP.log"
+touch "${TEMP_GREP}"
+IP_SCAN_PDIR="${PROCESS_PATH}/ip-scan/"
+mkdir -p "${IP_SCAN_PDIR}"
+DB_PATH_CACHE="${DB_PATH}/cache/"
+mkdir -p "${DB_PATH_CACHE}"
+AIPDB_IP_CACHED="${DB_PATH_CACHE}/aipdb_ip.cache"
+touch "${AIPDB_IP_CACHED}"
+AIPDB_IP_REPORTED_CACHED="${DB_PATH_CACHE}/aipdb_ip_reported.cache"
+touch "${AIPDB_IP_REPORTED_CACHED}"
+RBL_BLACKLISTED_IP_CACHED="${DB_PATH_CACHE}/rbl_blacklisted_ip.cache"
+touch "${RBL_BLACKLISTED_IP_CACHED}"
+
+SUPPRESSED_IP="${CONFIG_PATH}/suppressed_ip.lst"
+touch "${SUPPRESSED_IP}"
+WHITELISTED_IP="${CONFIG_PATH}/whitelisted_ip.lst"
+touch "${WHITELISTED_IP}"
+IGNORED_IP="${CONFIG_PATH}/ignored_ip.lst"
+touch "${IGNORED_IP}"
+SUPPRESSED_MSG="${CONFIG_PATH}/suppressed_msg.lst"
+touch "${SUPPRESSED_MSG}"
+ALERT_FILE="${CONFIG_PATH}/alert_file.lst"
+touch "${ALERT_FILE}"
+if ! [ -s "${ALERT_FILE}" ]; then
+  echo "[${SCRIPT_NAME}]: Warning,[$ALERT_FILE] is empty. Adding default entry ... "
+  echo "/var/log/messages GENERAL SYSTEM MESSAGE LOG" >"${ALERT_FILE}"
+fi
+# GET ALERT LOG PATH AND INFO
+ALERT_LOCS=$(awk '{ print $1 }' "${ALERT_FILE}")
+ALERT_INFO=$(awk '{$1=""; $0=$0; $1=$1; print}' "${ALERT_FILE}")
+# PROCESS FLAG #Temporarily not using this flag
+PFLAG="$CONFIG_PATH/p_flag"
+touch "${PFLAG}"
+
+# Get all variables from maxicata.env
+if [ -s "${CONFIG_PATH}/maxicata.env" ]; then
+  source "${CONFIG_PATH}/maxicata.env"
+else
+  echo "[${SCRIPT_NAME}]: Error, ${CONFIG_PATH}/maxicata.env does not exist or empty. Need this configuration file"
+  exit 1
+fi
+# SCRIPT ARGUMENTS
+#ARGS="$*"
+ARGNUM="$#"
+# Handle option arguments
+if [ $ARGNUM -eq 0 ]; then
+  echo "[${SCRIPT_NAME}]: Error, no argument is supplied. Use --help to see the valid options"
+fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  -h | --help) # Display help and usage
+    usage
+    exit 0
+    ;;
+  -v | --version) # Display Program version
+    echo "v1.0.1 - By MaXi32 aka Arafat Ali"
+    break
+    ;;
+  -c | --command) # pass command to use specific standalone function like calculating ip and produce a file output
+    #opt="$1"
+    cmd_args "$@"
+    break
+    ;;
+  # This will only clear database cache it will keep csf rule and config rules
+  -init | --init)
+    init
+    runstatus
+    break
+    ;;
+  # This will clear everything and start everything back
+  -initfull | --init-full | -fullinit | --fullinit | --initfull)
+    init_full
+    runstatus
+    break
+    ;;
+  -e | --start) # Start Maxicata
+    start
+    runstatus
+    break
+    ;;
+  -l | --log) # Logging options
+    opt="$2"
+    if [ -z "${opt}" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/suricata.log"
+      tail -n 25 -f "/var/log/suricata/suricata.log"
+    fi
+    if [ "${opt}" == "m" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata.log"
+      tail -n 25 -f "/var/log/suricata/maxicata.log"
+    fi
+    if [ "${opt}" == "myn" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata-yn.log"
+      tail -n 25 -f "/var/log/suricata/maxicata-yn.log"
+    fi
+    if [ "${opt}" == "my" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata-y.log"
+      tail -n 25 -f "/var/log/suricata/maxicata-y.log"
+    fi
+    if [ "${opt}" == "mn" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata-n.log"
+      tail -n 25 -f "/var/log/suricata/maxicata-n.log"
+    fi
+
+    if [ "${opt}" == "maily" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata-y-mail.log"
+      tail -n 25 -f "/var/log/suricata/maxicata-y-mail.log"
+    fi
+    if [ "${opt}" == "mailn" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata-n-mail.log"
+      tail -n 25 -f "/var/log/suricata/maxicata-n-mail.log"
+    fi
+    if [ "${opt}" == "ipcache" ]; then
+      echo "[${SCRIPT_NAME}]: Tailing log file from: ${AIPDB_IP_CACHED}"
+      tail -n 25 -f "${AIPDB_IP_CACHED}"
+    fi
+    break
+    ;;
+  -x | --stop)
+    stop
+    runstatus
+    break
+    ;;
+  -p | --pause | --sleep)
+    pause
+    runstatus
+    break
+    ;;
+  -s | --status)
+    runstatus
+    break
+    ;;
+  # Edit full, clear the file first before edit
+  -editf | --editf)
+    opt="$1"
+    file="$2"
+    if [ "${file}" == "maxicata.lua" ]; then
+      maxicata_lua_code="${CODE_PATH}${MAXICATA_LUA}"
+      cat /dev/null >"${maxicata_lua_code}"
+      nano -c "${maxicata_lua_code}"
+    fi
+    if [ "${file}" == "maxirbl" ]; then
+      maxirbl_code="${SCRIPT_PATH}/maxirbl"
+      cat /dev/null >"${maxirbl_code}"
+      nano -c "${maxirbl_code}"
+    fi
+
+    break
+    ;;
+  # Normal edit don't clear the file
+  -edit | --edit)
+    opt="$1"
+    file="$2"
+    if [ "${file}" == "maxicata.lua" ]; then
+      maxicata_lua_code="${CODE_PATH}${MAXICATA_LUA}"
+      nano -c "${maxicata_lua_code}"
+    fi
+    if [ "${file}" == "maxirbl" ]; then
+      maxirbl_code="${SCRIPT_PATH}/maxirbl"
+      nano -c "${maxirbl_code}"
+    fi
+    if [ "${file}" == "csf.deny" ]; then
+      csf_deny_list="/etc/csf/csf.deny"
+      nano -c "${csf_deny_list}"
+    fi
+    if [ "${file}" == "suricata.service" ]; then
+      suricata_service_file="${CODE_PATH}/etc/systemd/system/suricata.service"
+      nano -c "${suricata_service_file}"
+    fi
+    break
+    ;;
+  # Not using right now
+  -initconfig | --initconfig)
+    opt="$1"
+    file="$2"
+    if [ "${file}" == "maxicata.lua" ]; then
+      maxicata_lua_code="${CODE_PATH}${MAXICATA_LUA}"
+      cp -pf "${maxicata_lua_code}" "${MAXICATA_LUA}"
+    fi
+    break
+    ;;
+  # Usage: maxicata -sip <ip_address> <signature_id> <comment string>
+  -sip | --suppress-ip)
+    # This one should be used for putting IP as non-critical -TODO
+    # TODO function suppress (function use to put ip as non-critical) that is the meaning of suppress it will use ${SUPPRESSED_IP}
+    # also look for TODO 10 in maxicata.lua for more condition
+    opt="$1"
+    ip_add="$2"
+    sid="$3"
+    msg_comment="${*:4}"
+    if [ -z "${sid}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing signature ID. e.g: ${SCRIPT_NAME} ${opt} <ip> 12344 <comment string>"
+      exit 0
+    fi
+    check_sip=$(grep -w "[^.0-9a-fA-F]${ip_add}[^.0-9a-fA-F]" "${SUPPRESSED_IP}")
+    # If IP is in the cached file, then just display error
+    if [ -n "${check_sip}" ]; then
+      echo "[${SCRIPT_NAME}]: Warning, IP [${ip_add}] is already in the suppress file"
+    else
+      echo "|ip_address: ${ip_add} |sid: ${sid} |time: $(date +%s) |comment: ${msg_comment}" >>"${SUPPRESSED_IP}"
+      echo "[${SCRIPT_NAME}]: Success, IP [${ip_add}] is now in suppressed list and will be put in non-critical alert report"
+    fi
+    break
+    ;;
+  # Usage: maxicata -wip <ip_address> <signature_id> <comment string>
+  # TODO next feature is to make sure maxicata.lua able to include signature ID when suppressing using this whitelisted_IP
+  -wip | --whitelist-ip)
+    opt="$1"
+    ip_add="$2"
+    sid="$3"
+    msg_comment="${*:4}"
+
+    if [ -z "${ip_add}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4 <signature_id> <comment string>"
+      exit 0
+    fi
+    if [ -z "${sid}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing signature ID. e.g: ${SCRIPT_NAME} ${opt} <ip> 12344 <comment string>"
+      exit 0
+    fi
+    check_sip=$(grep -w "[^.0-9a-fA-F]${ip_add}[^.0-9a-fA-F]" "${WHITELISTED_IP}")
+    # If IP is in the cached file, then just display error
+    if [ -n "${check_sip}" ]; then
+      echo "[${SCRIPT_NAME}]: Warning, IP [${ip_add}] is already in the whitelist file"
+    else
+      echo "|ip_address: ${ip_add} |sid: ${sid} |time: $(date +%s) |comment: ${msg_comment}" >>"${WHITELISTED_IP}"
+      echo "[${SCRIPT_NAME}]: Success, IP [${ip_add}] is now in whitelisted file and won't be reported in suricata"
+    fi
+    break
+    ;;
+  # Usage: maxicata -iip <ip_address> <signature_id> <comment string>
+  # TODO next feature is to make sure maxicata.lua able to include signature ID when suppressing using this ignored_ip
+  # This one similar to whitelist but ignore list is made special for bad IP. whitelist is for good IP.
+  -iip | --ignore-ip)
+    opt="$1"
+    ip_add="$2"
+    sid="$3"
+    msg_comment="${*:4}"
+
+    if [ -z "${ip_add}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4 <signature_id> <comment string>"
+      exit 0
+    fi
+    if [ -z "${sid}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing signature ID. e.g: ${SCRIPT_NAME} ${opt} <ip> 12344 <comment string>"
+      exit 0
+    fi
+    check_iip=$(grep -w "[^.0-9a-fA-F]${ip_add}[^.0-9a-fA-F]" "${IGNORED_IP}")
+    # If IP is in the cached file, then just display error
+    if [ -n "${check_iip}" ]; then
+      echo "[${SCRIPT_NAME}]: Warning, IP [${ip_add}] is already in the ignore list file"
+    else
+      echo "|ip_address: ${ip_add} |sid: ${sid} |time: $(date +%s) |comment: ${msg_comment}" >>"${IGNORED_IP}"
+      echo "[${SCRIPT_NAME}]: Success, IP [${ip_add}] is now in ignored list file and won't be reported in suricata"
+    fi
+    break
+    ;;
+  # Usage: maxicata -smsg <expired_duration> <msg_rule_string> -OLD
+  # Usage: maxicata -smsg <msg_rule_string> - NEW
+  # This is a global suppression which is not recommended but useful
+  -smsg | --suppress-msg)
+    opt="$1"
+    # Must be a number so we specify re below here
+    # If we supply invalid number for the 2nd argument, it will default to 0
+    #exp="$2"
+    #exp_rule='^[0-9]+$'
+    msg_rule="${*:2}"
+    num_arg="$#"
+
+    # if num_Arg -le 2 means i don't provide msg
+    if [ "${num_arg}" -le 1 ]; then
+      echo "[${SCRIPT_NAME}]: Error, not enough argument eg: ${SCRIPT_NAME} ${opt} 'Suricata Invalid Checksum'"
+      exit 1
+    fi
+    #if [ -z "${msg_rule}" ]; then
+    #  echo "[${SCRIPT_NAME}]: Error, please provide the message string. eg: ${SCRIPT_NAME} ${opt} 'Suricata Invalid Checksum'"
+    #fi
+    #echo ${exp}
+    #echo "${msg_rule}"
+    check_smsg=$(grep -w "|msg: ${msg_rule}" "${SUPPRESSED_MSG}")
+    if [ -n "${check_smsg}" ]; then
+      echo "[${SCRIPT_NAME}]: Warning, message rule string is already in the message suppress file"
+    else
+      echo "|msg: ${msg_rule} |time: $(date +%s)" >>"${SUPPRESSED_MSG}"
+      echo "[${SCRIPT_NAME}]: Success, new message rule has been added in suppress file and will be put in non-critical alert report"
+    fi
+    break
+    ;;
+  # Usage: maxicata -d <ip_network> <ip2> <comment>
+  # eg: maxicata -d 1.2.3.4 This IP is not good
+  # Use this better than csf -d because csf -d don't have CIDR validation and makes IP redundant
+  # Also CSF don't remove redundant IP if given CIDR to block, it should also remove IP within that CIDR range to improve performance
+  # OK
+  -d | --deny | -dip | --deny-ip)
+
+    opt="$1"
+    ip="$2"
+    report_to_aipdb="$3"
+    ret=0
+    ip_country="Unknown"
+    ip_label="Unknown"
+    # Not useful yet
+    #ip_net_blocked=false
+    is_cidr=$(
+      ${SCRIPT_NAME} -cidr-q "${ip}"
+      echo $?
+    )
+    ip_country=$(curl -s -f "https://api.ipgeolocationapi.com/geolocate/${ip}" | jq --raw-output '.name')
+    ret=$?
+    if [ "${ret}" -ne 0 ]; then
+      ip_country="Unknown"
+    fi
+    if [ "${is_cidr}" = 0 ]; then
+      ip_label="Network address"
+      ip_country="CIDR-IP"
+
+    else
+      ip_label="IP address"
+
+    fi
+    msg_comment="${SCRIPT_NAME} Manual-Deny: ${*:3}"
+    if [ -z "${ip}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4"
+      exit 1
+    fi
+
+    if [ "$(
+      ipcalc -c -s "${ip}"
+      echo $?
+    )" = 1 ]; then
+      echo "[${SCRIPT_NAME}]: Error, bad IP address format: ${ip}"
+      exit 1
+    else
+      # Check if IP is in the network CIDR: return 0 - yes, return 1 - false
+      #ip_net_blocked=$(
+      #  echo "${ip}" | grepcidr -f "${CSF_IP_PERM_DENY}" >/dev/null
+      #  echo $?
+      #)
+      #Use this new method will also detect CIDR format
+      check_csf_deny=$(csf -g "${ip}" | grep -E 'IPSET: Set:chain_DENY Match:')
+      if [ -n "$check_csf_deny" ]; then
+        # is blocked in permanent list
+        #if [ "${ip_net_blocked}" = 0 ]; then
+        echo "[${SCRIPT_NAME}]: Error, ${ip_label} [${ip}] is already in the deny list"
+        #else
+        #  echo "[${SCRIPT_NAME}]: Error, ${ip_label} [${ip}] is already in the deny list"
+        #fi
+      else
+        cidr_temp="${TEMP_PATH}/cidr_temp"
+        is_cidr=$(
+          ${SCRIPT_NAME} --validate-cidr-quite "${ip}"
+          echo $?
+        )
+        # echo "false"
+        # is not block in permanent list
+        echo "[${SCRIPT_NAME}]: Blocking ${ip_label} ${ip} [${ip_country}] in CSF with the following comment: '${msg_comment}' ..."
+        # If IP is in CIDR form, we block using CIDR form, if not then use the ip variable
+
+        block_status=$(csf -d "${ip}" "${msg_comment}")
+        success_block=$(echo "${block_status}" | grep 'Adding')
+        ret=$?
+        if [ "${ret}" = 1 ]; then
+          echo "[${SCRIPT_NAME}]: ${block_status}"
+        else
+          # Show success block
+          echo "[${SCRIPT_NAME}]: ${success_block}"
+          # IF ip is in CIDR form, we need to remove existing IP in this CIDR form:
+          if [ "${is_cidr}" = 0 ]; then
+
+            awk '{ print $1 }' "${CSF_IP_PERM_DENY}" | grep -v '^\s*$\|^\s*\#' >"${cidr_temp}"
+            ip_in_cidr=$(awk -v val="${ip}" '
+          BEGIN{
+            match(val,/.*\./)
+            matched=substr(val,RSTART,RLENGTH-1)
+            split(substr(val,RSTART+RLENGTH),arr,"/")
+            for(i=arr[1];i<=arr[2];i++){
+             skip[matched"."i]
+            }
+          }
+          ($1 in skip)
+          ' "${cidr_temp}")
+            # If there's a value then we remove using csf -dr
+            if [ -n "${ip_in_cidr}" ]; then
+              echo "[${SCRIPT_NAME}]: Notice, found duplicated IP(s) within this CIDR"
+              echo "----"
+              # echo "${ip_in_cidr}"
+              for cip in ${ip_in_cidr}; do
+                csf -dr "${cip}"
+                # TODO ret here
+                echo "OK"
+                echo "----"
+              done
+            else
+              echo "[${SCRIPT_NAME}]: Found No IP with this CIDR range"
+            fi
+            echo "[${SCRIPT_NAME}]: Now, restarting CSF and LFD ..."
+            csf -ra >/dev/null
+            ret=$?
+            if [ "${ret}" = 0 ]; then
+              echo "[${SCRIPT_NAME}]: OK"
+            else
+              echo "[${SCRIPT_NAME}]: Warning, Something is wrong when restarting CSF"
+            fi
+          else
+            # TODO TESTING REPORT WITH ARGUMENT
+            if [ "${report_to_aipdb}" == "aipdb-report" ]; then
+              echo "[${SCRIPT_NAME}]: Reporting this IP to AIPDB ..."
+              default_category="15"
+              report_status=$(${SCRIPT_NAME} -c report-to-aipdb "${ip}" "${default_category}" "${msg_comment}")
+              echo "[${SCRIPT_NAME}]: ${report_status}"
+            fi
+          fi
+        fi
+      fi
+    fi
+
+    # No need yet
+    # After put in deny, must delete this IP from the suricata log because it doesn't make sense to record it.
+    # pause the monitor process
+    # pause
+    # echo ""
+    # rcount=0
+    # while read -r line; do
+    #  echo "Report line to remove from ${MAXICATA_LOG_YN}:"
+    #  echo "---------"
+    #  awk -v d="${line}" '$0 != d' $MAXICATA_LOG_YN >"${TEMP_PATH}/temp_file" && mv "${TEMP_PATH}/temp_file" $MAXICATA_LOG_YN
+    #  RET_VAL=$?
+    #  if [ $RET_VAL = 0 ]; then
+    #    ((rcount++))
+    #    echo "Removed OK: $line"
+    #    echo ""
+    #  else
+    #    echo "Removed Error: $line"
+    #    echo ""
+    #  fi
+    #done < <(grep -r "${ip_add}" "${MAXICATA_LOG_YN}") # Change here if use this method.....
+    #echo "---------"
+    #echo "$rcount record has been removed from ${MAXICATA_LOG_YN}"
+    #start
+    #runstatus
+    break
+    ;;
+  # Remove the mail queue
+  -rmq | --remove-mail-q)
+    service exim stop
+    rm -fvr /var/spool/exim/input
+    service exim restart
+    break
+    ;;
+  -t | -test | --test)
+    opt="$1"
+    suri_interface=$(grep -w 'All AFP capture threads are running' ${SURICATA_SYSTEM_LOG})
+    echo "${suri_interface}"
+    break
+    ;;
+  # In CSF if you remove IP with CIDR, you just remove that CIDR group not IP containing that CIDR (which cause redundant).
+  # Using this option fixed that TODO
+  -dr | -rd | --deny-remove | --remove-deny)
+    opt="$1"
+    ip_add="$2"
+    echo "[${SCRIPT_NAME}]: Removing ${ip_add} IP address [${ip_add}/${ip_country}] from CSF ..."
+    csf -dr "${ip_add}"
+    echo "[${SCRIPT_NAME}]: Now, restarting CSF and LFD ..."
+    csf -ra >/dev/null
+    break
+    ;;
+  -td | --temp-deny)
+    opt="$1"
+    echo "[${SCRIPT_NAME}]: I have not implemented this option ${opt} yet"
+    break
+    ;;
+  -tr | --temp-deny-remove)
+    opt="$1"
+    echo "[${SCRIPT_NAME}]: I have not implemented this option ${opt} yet"
+    break
+    ;;
+    # Usage: ipinfo <ip_address> <optional_reportname>
+  -vcidr | --validate-cidr)
+    opt="$1"
+    ip_add="$2"
+    CIDR_REGEX='(((25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?))(\/([8-9]|[1-2][0-9]|3[0-2]))([^0-9.]|$)'
+    if [ "$1" = "" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4/24"
+      exit 1
+    fi
+    if echo "${ip_add}" | grep -Pq "${CIDR_REGEX}"; then
+      echo "[${SCRIPT_NAME}]: Ok, ${ip_add} is a valid CIDR!"
+      #exit 0
+    else
+      echo "[${SCRIPT_NAME}]: Error, ${ip_add} is not a valid CIDR!"
+      #exit 1
+    fi
+    break
+    ;;
+  -cidr-q | --validate-cidr-quite)
+    opt="$1"
+    ip_add="$2"
+    CIDR_REGEX='(((25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?))(\/([8-9]|[1-2][0-9]|3[0-2]))([^0-9.]|$)'
+    if [ "$1" = "" ]; then
+      exit 1
+    fi
+    if echo "${ip_add}" | grep -Pq "${CIDR_REGEX}"; then
+      exit 0
+    else
+      exit 1
+    fi
+    break
+    ;;
+  # maxicata -ip2cidr <ip> <mask_bit>
+  # eg: maxicata -ip2cidr 1.1.1.1 24
+  -i2c | --ip2cidr)
+    opt="$1"
+    ip_add="$2"
+    mask_bit="$3"
+    if [ -z "${ip_add}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4 24"
+      exit 1
+    fi
+    if [ -z "${mask_bit}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing mask bit argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4 24"
+      exit 1
+    fi
+    if [ "${mask_bit}" == "24" ]; then
+      oc1=$(echo "${ip_add}" | cut -d '.' -f 1)
+      oc2=$(echo "${ip_add}" | cut -d '.' -f 2)
+      oc3=$(echo "${ip_add}" | cut -d '.' -f 3)
+      ip="${oc1}.${oc2}.${oc3}.0/24"
+      echo "${ip}"
+      exit 0
+    else
+      exit 1
+    fi
+    #
+    break
+    ;;
+  -i | --info | -cip | --checkip)
+    opt="$1"
+    ip_add="$2"
+    if [ -z "${ip_add}" ]; then
+      echo "[${SCRIPT_NAME}]: Error, missing IP address argument. e.g: ${SCRIPT_NAME} ${opt} 1.2.3.4"
+      exit 0
+    fi
+    ipinfo "${ip_add}"
+    break
+    ;;
+  # Usage maxicata --box-reboot <duration_in_second>
+  -br | -sr | -rb | -rs | --box-reboot | -system-reboot)
+    opt="$1"
+    duration="$2"
+    duration=15
+    ${SCRIPT_NAME} --stop
+    echo "[${SCRIPT_NAME}]: Rebooting server in ${duration} second(s). Press CTRL + C to cancel ..."
+    sleep ${duration}
+    shutdown now
+    break
+    ;;
+  -cl | --clearlog)
+    opt="$1"
+    echo "[${SCRIPT_NAME}]: I have not implemented this option ${opt} yet"
+    break
+    ;;
+  -clrip | --clearip)
+    opt="$1"
+    clear_ipcache
+    break
+    ;;
+  -clrbl | --clearbl)
+    opt="$1"
+    clear_blcache
+    break
+    ;;
+  -us | -su | --update-suricata | --suricata-update | --update-rule | --rule-update | -ur | -ru)
+    opt="$1"
+    echo "[${SCRIPT_NAME}]: Updating suricata rule definition ..."
+    update_suricata
+    break
+    ;;
+  -clcache | --clearcache)
+    opt="$1"
+    clear_cache
+    break
+    ;;
+  -clearcsf | --clearcsf)
+    clear_csf_deny
+    break
+    ;;
+  -log | --suricatalog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/suricata.log"
+    tail -n 25 -f "/var/log/suricata/suricata.log"
+    break
+    ;;
+  -mlog | --maxicatalog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata.log"
+    tail -n 25 -f "/var/log/suricata/maxicata.log"
+    break
+    ;;
+  -mhttplog | --maxicatahttplog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/maxicata_http.log"
+    tail -n 25 -f "/var/log/suricata/maxicata_http.log"
+    break
+    ;;
+  -statlog | --statslog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/stats.log"
+    tail -n 25 -f "/var/log/suricata/stats.log"
+    break
+    ;;
+  -fastlog | --fastlog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/fast.log"
+    tail -n 25 -f "/var/log/suricata/fast.log"
+    break
+    ;;
+  -shttplog | --suricatahttplog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/http.log"
+    tail -n 25 -f "/var/log/suricata/http.log"
+    break
+    ;;
+  -evelog | --evelog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/suricata/eve.json"
+    tail -n 25 -f "/var/log/suricata/eve.json"
+    break
+    ;;
+  -modlog | --modlog)
+    echo "[${SCRIPT_NAME}]: Tailing log file from: /var/log/nginx/modsec_audit.log"
+    tail -n 25 -f "/var/log/nginx/modsec_audit.log"
+    break
+    ;;
+  --)
+    break
+    ;;
+  -*)
+    opt="${opt}"
+    echo "Invalid option '${opt}'. Use --help to see the valid options"
+    exit 1
+    ;;
+  # an option argument, continue
+  *) ;;
+  esac
+  shift
+done
